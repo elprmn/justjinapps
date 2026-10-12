@@ -391,7 +391,7 @@ async def live_follow_metrics(rec):
 
 
 async def build_live_trades_embed(user):
-    """Premium dashboard-style snapshot for followed OPEN paper trades."""
+    """Build text fallback embed plus a rendered Modern Card PNG dashboard."""
     recs = await db.user_follows(user.id, 200)
     open_recs = [r for r in recs if r.get("status") == "OPEN"][:20]
     if not open_recs:
@@ -410,9 +410,15 @@ async def build_live_trades_embed(user):
         embed.add_field(name="OPEN POSITIONS", value="`00`", inline=True)
         embed.add_field(name="MODE", value="`PAPER`", inline=True)
         embed.set_footer(text="BYBIT MARKET SNAPSHOT  •  Paper trading only — no real orders")
-        return embed
+        try:
+            png = render_modern_card_dashboard([], 0.0, 0.0, 0.0, user.display_name)
+        except Exception:
+            log.exception("Gagal merender gambar dashboard kosong; memakai fallback teks")
+            png = None
+        return embed, png
 
     net_values = []
+    image_positions = []
     gross_values = []
     fields = []
     for rec in open_recs:
@@ -429,6 +435,12 @@ async def build_live_trades_embed(user):
             net = live["net_pct"]
             gross_values.append(pnl)
             net_values.append(net)
+            image_positions.append({
+                "symbol": rec.get("symbol", "UNKNOWN"), "side": side,
+                "timeframe": rec.get("timeframe", "?"), "net": net, "gross": pnl,
+                "entry": entry, "last": live["price"], "sl": sl, "tp": tp,
+                "age_ts": age_ts, "age": age,
+            })
             net_icon = "🟩" if net >= 0 else "🟥"
             # Keep each position as its own full-width card-like embed field for mobile.
             # Avoid custom emoji dependencies; compact metadata line works on every server.
@@ -482,7 +494,83 @@ async def build_live_trades_embed(user):
     for title, value in fields:
         embed.add_field(name=title, value=value, inline=False)
     embed.set_footer(text="ROI estimasi 1x tanpa leverage · Fee, spread, slippage & funding diestimasi · Bukan order nyata")
-    return embed
+    try:
+        png = render_modern_card_dashboard(image_positions, total_net, total_gross, avg_net, user.display_name)
+    except Exception:
+        log.exception("Gagal merender gambar dashboard; memakai fallback embed teks")
+        png = None
+    return embed, png
+
+
+def render_modern_card_dashboard(positions, total_net, total_gross, avg_net, display_name):
+    """Render a mobile-first Modern Card PNG. All values come from the live /trade snapshot."""
+    from PIL import Image, ImageDraw, ImageFont
+    import math
+
+    width = 1100
+    pad = 54
+    card_h = 250
+    gap = 24
+    height = 390 + (card_h + gap) * max(1, min(len(positions), 12)) + 70
+    height = min(height, 390 + (card_h + gap) * 12 + 70)
+    im = Image.new("RGB", (width, height), (7, 14, 27))
+    d = ImageDraw.Draw(im)
+    try:
+        regular = ImageFont.truetype("DejaVuSans.ttf", 25)
+        small = ImageFont.truetype("DejaVuSans.ttf", 20)
+        medium = ImageFont.truetype("DejaVuSans-Bold.ttf", 26)
+        large = ImageFont.truetype("DejaVuSans-Bold.ttf", 54)
+        title_font = ImageFont.truetype("DejaVuSans-Bold.ttf", 34)
+        metric_font = ImageFont.truetype("DejaVuSans-Bold.ttf", 32)
+    except OSError:
+        regular = small = medium = large = title_font = metric_font = ImageFont.load_default()
+
+    bg_card = (14, 27, 46); border = (31, 57, 80); white = (239, 246, 255)
+    muted = (148, 169, 194); green = (37, 230, 167); red = (255, 76, 108)
+    d.rounded_rectangle((pad, 34, width-pad, 140), radius=28, fill=(12, 31, 48), outline=(20, 135, 119), width=2)
+    d.text((pad+28, 55), "JUSTJINAPPS  /  TRADING DASHBOARD", font=title_font, fill=white)
+    d.text((pad+30, 105), f"{display_name}  ·  BYBIT PERPETUALS  ·  PAPER TRADING", font=small, fill=muted)
+
+    top, bottom = 164, 345
+    box_gap = 18
+    box_w = (width - 2*pad - 2*box_gap)//3
+    metrics = [("NET PNL · EST.", total_net, green if total_net >= 0 else red),
+               ("GROSS PNL", total_gross, green if total_gross >= 0 else red),
+               ("AVG NET / TRADE", avg_net, green if avg_net >= 0 else red)]
+    for i, (label, val, col) in enumerate(metrics):
+        x = pad + i*(box_w+box_gap)
+        d.rounded_rectangle((x, top, x+box_w, bottom), radius=24, fill=bg_card, outline=border, width=2)
+        d.text((x+22, top+24), label, font=small, fill=muted)
+        d.text((x+22, top+72), f"{val:+.2f}%", font=metric_font, fill=col)
+        d.text((x+22, top+126), "LIVE SNAPSHOT", font=small, fill=(93, 119, 149))
+
+    y = 375
+    d.text((pad, y), f"OPEN POSITIONS  ·  {len(positions):02d}", font=title_font, fill=white)
+    y += 60
+    if not positions:
+        d.rounded_rectangle((pad, y, width-pad, y+150), radius=24, fill=bg_card, outline=border, width=2)
+        d.text((pad+28, y+35), "NO ACTIVE POSITIONS", font=medium, fill=muted)
+        d.text((pad+28, y+83), "Join a signal to see live PNL here.", font=regular, fill=white)
+        y += 150
+    for pos in positions[:12]:
+        if y + card_h > height - 50:
+            break
+        col = green if pos["net"] >= 0 else red
+        d.rounded_rectangle((pad, y, width-pad, y+card_h), radius=24, fill=bg_card, outline=border, width=2)
+        d.rounded_rectangle((pad, y, pad+10, y+card_h), radius=5, fill=col)
+        d.text((pad+30, y+22), f'{pos["symbol"]}  ·  {pos["side"]}  ·  {pos["timeframe"]}M', font=medium, fill=white)
+        d.rounded_rectangle((width-pad-145, y+18, width-pad-30, y+58), radius=18, fill=(14, 74, 63) if pos["net"] >= 0 else (86, 28, 48))
+        d.text((width-pad-128, y+25), "OPEN", font=small, fill=green if pos["net"] >= 0 else red)
+        d.text((pad+30, y+76), f'{pos["net"]:+.2f}% NET', font=large, fill=col)
+        d.text((pad+430, y+85), f'GROSS  {pos["gross"]:+.2f}%', font=medium, fill=muted)
+        d.line((pad+28, y+145, width-pad-28, y+145), fill=border, width=2)
+        d.text((pad+30, y+163), f'ENTRY  {pos["entry"]:.10g}   →   LAST  {pos["last"]:.10g}', font=small, fill=white)
+        d.text((pad+30, y+202), f'SL  {pos["sl"]:.10g}      TP  {pos["tp"]:.10g}      {pos.get("age", "time n/a")}', font=small, fill=muted)
+        y += card_h + gap
+    d.text((pad, height-43), "ROI estimate at 1x · Fees/slippage estimated · No real orders", font=small, fill=muted)
+    output = io.BytesIO()
+    im.save(output, format="PNG", optimize=True)
+    return output.getvalue()
 
 
 async def build_history_embed(user, mode="all"):
@@ -953,7 +1041,21 @@ async def trade_cmd(interaction: discord.Interaction):
     if db is None or market is None:
         await interaction.followup.send("Layanan belum siap, coba lagi sebentar.", ephemeral=True)
         return
-    await interaction.followup.send(embed=await build_live_trades_embed(interaction.user), ephemeral=True)
+    embed, png = await build_live_trades_embed(interaction.user)
+    if png:
+        file = discord.File(io.BytesIO(png), filename="trade-dashboard.png")
+        # In image mode, keep the Discord embed as a clean caption; the PNG is the dashboard.
+        embed.clear_fields()
+        embed.title = "📊 TRADE DASHBOARD · MODERN CARD"
+        embed.description = "Live snapshot dari posisi yang kamu ikuti. Detail PNL dan level posisi ada pada kartu gambar di bawah."
+        embed.set_image(url="attachment://trade-dashboard.png")
+        await interaction.followup.send(embed=embed, file=file, ephemeral=True)
+    else:
+        # Reliable fallback: text embed retains the same live values and all existing fields.
+        await interaction.followup.send(
+            content="⚠️ Gambar dashboard gagal dibuat; menampilkan ringkasan teks.",
+            embed=embed, ephemeral=True
+        )
 
 
 @bot.tree.command(name="riwayat", description="Riwayat trade yang kamu ikuti (Follow Trade)")

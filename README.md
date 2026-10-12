@@ -26,7 +26,7 @@ Net R mengurangi estimasi fee round-trip (`FEE_PCT`), spread saat sinyal, slippa
 - Tiap pesan **SIGNAL** punya tombol **✅ Ikut Trade** dan **📋 Riwayat Saya**.
 - Saat ikut, bot mencatat harga pasar saat itu sebagai harga masuk. Ditolak jika harga sudah menyentuh TP/SL atau sudah ≥ `FOLLOW_MAX_DRIFT_R` (0,5R) menuju TP.
 - Saat TP/SL tersentuh, bot menghitung hasil tiap follower dari harga masuk masing-masing (gross R dan net R setelah fee), mengubah footer pesan sinyal, menonaktifkan tombol, dan me-reply dengan mention para follower.
-- `/trade` menampilkan embed privat PnL/ROI berjalan per follow, harga entry/current, estimasi net setelah biaya, SL/TP, dan lama trade (contoh: `SUIUSDT L · 15m · PnL +1.25% · 12 menit lalu`). Snapshot diperbarui saat command dipanggil. ROI ditampilkan pada asumsi 1x/tanpa leverage karena leverage/modal tidak dikonfigurasi.
+- `/trade` membuat kartu dashboard PNG bergaya Modern Card dari snapshot harga terbaru, berisi ringkasan Net/Gross/Avg PNL serta kartu tiap posisi (arah, PNL, Entry/Last, SL/TP). Gambar dibuat saat command dipanggil dan dikirim sebagai attachment Discord. Jika rendering gambar gagal, bot mengirim embed teks lengkap sebagai fallback. ROI ditampilkan pada asumsi 1x/tanpa leverage karena leverage/modal tidak dikonfigurasi.
 - `/riwayat [Semua | Berjalan | Selesai]` menampilkan WR, total net R, dan 12 trade terbaru (hanya terlihat oleh kamu); trade yang masih berjalan juga memuat PnL/net estimasi jika harga tersedia.
 - Tombol bersifat persisten: tetap berfungsi setelah bot restart/redeploy.
 - Ini **simulasi**, bukan order nyata.
