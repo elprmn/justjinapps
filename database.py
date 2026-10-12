@@ -46,6 +46,12 @@ class Database:
             await p.execute()
         return True
 
+    async def claim_watch(self, s, cooldown_minutes):
+        """True jika notifikasi WATCH untuk pair+arah ini boleh dikirim (cooldown atomik via SET NX)."""
+        key = self.key(f"watch:{s['symbol']}:{s['direction']}")
+        ok = await self.redis.set(key, str(s.get("candle_start") or ""), nx=True, ex=max(60, int(cooldown_minutes) * 60))
+        return bool(ok)
+
     async def get_open_signals(self, limit=40):
         return [r for r in await self._recent_records(1000) if r.get("status") == "OPEN"][:limit]
 

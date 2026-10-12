@@ -1,3 +1,4 @@
+import io
 import os
 import asyncio
 import logging
@@ -10,6 +11,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from market import BybitMarket, analyze_symbol, fmt_price, INTERVALS
+from chart import render_chart, CHART_ENABLED
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("signalbot")
@@ -23,6 +25,11 @@ MIN_TURNOVER_24H = max(1_000_000, float(os.getenv("MIN_TURNOVER_24H", "5000000")
 SCAN_TIMEFRAMES = tuple(x.strip() for x in os.getenv("SCAN_TIMEFRAMES", "5,15,30").split(",") if x.strip() in INTERVALS)
 SIGNAL_MAX_AGE_MINUTES = max(30, int(os.getenv("SIGNAL_MAX_AGE_MINUTES", "180")))
 COOLDOWN_MINUTES = max(5, int(os.getenv("COOLDOWN_MINUTES", "30")))
+# WATCH = indikasi awal long/short (tren 30m searah, skor >= MIN_WATCH_SCORE) walau belum jadi SIGNAL penuh.
+MIN_WATCH_SCORE = max(40, min(MIN_SIGNAL_SCORE, int(os.getenv("MIN_WATCH_SCORE", "55"))))
+WATCH_COOLDOWN_MINUTES = max(5, int(os.getenv("WATCH_COOLDOWN_MINUTES", "30")))
+WATCH_MAX_PER_SCAN = max(1, min(10, int(os.getenv("WATCH_MAX_PER_SCAN", "5"))))
+ALERT_ROLE_ID = os.getenv("ALERT_ROLE_ID", "").strip().strip("\"\'").strip()  # opsional: role yang di-ping
 if not DISCORD_TOKEN:
     raise RuntimeError("DISCORD_TOKEN belum diisi pada environment variables.")
 if not SCAN_TIMEFRAMES:
@@ -105,10 +112,21 @@ async def store_signal(s):
     return await db.add_signal(s, COOLDOWN_MINUTES)
 
 
+def classify(s):
+    """SIGNAL = tren 30m + momentum 15m searah dan skor >= MIN_SIGNAL_SCORE; WATCH = indikasi awal."""
+    if s.get("confirm15") and s["score"] >= MIN_SIGNAL_SCORE:
+        return "SIGNAL"
+    if s["score"] >= MIN_WATCH_SCORE:
+        return "WATCH"
+    return None
+
+
 def signal_embed(s):
     is_long = s["direction"] == "LONG"
+    tier = classify(s)
+    status = {"SIGNAL": "✅ SIGNAL", "WATCH": "👀 WATCH (indikasi awal)"}.get(tier, "⚪ Lemah (di bawah ambang)")
     embed = discord.Embed(title=f'{s["symbol"]} · {s["direction"]}',
-        description=f'**TF entry:** {s["timeframe"]}m · **Skor teknikal:** {s["score"]}/100',
+        description=f'**Status:** {status}\n**TF entry:** {s["timeframe"]}m · **Skor teknikal:** {s["score"]}/100',
         color=discord.Color.green() if is_long else discord.Color.red(), timestamp=datetime.now(timezone.utc))
     embed.add_field(name="Entry referensi", value=fmt_price(s["entry"]), inline=True)
     embed.add_field(name="Stop Loss", value=fmt_price(s["sl"]), inline=True)
@@ -120,6 +138,36 @@ def signal_embed(s):
     embed.add_field(name="Konfirmasi", value="\n".join(f"• {x}" for x in s["reasons"][:6]), inline=False)
     embed.set_footer(text="Sinyal simulasi/edukasi; bukan probabilitas profit. Tidak ada order otomatis.")
     return embed
+
+
+def watch_embed(items):
+    embed = discord.Embed(title="👀 Setup terdeteksi (WATCH)",
+        description="Indikasi awal arah LONG/SHORT. **Belum sinyal entry penuh**; tunggu konfirmasi sebelum bertindak.",
+        color=discord.Color.gold(), timestamp=datetime.now(timezone.utc))
+    for s in items:
+        icon = "🟢" if s["direction"] == "LONG" else "🔴"
+        embed.add_field(
+            name=f'{icon} {s["symbol"]} · {s["direction"]} · TF {s["timeframe"]}m · {s["score"]}/100',
+            value=(f'Harga {fmt_price(s["entry"])} | SL ref {fmt_price(s["sl"])} | TP ref {fmt_price(s["tp"])} | '
+                   f'spread {s["spread_pct"]:.3f}% | 15m {"✓" if s.get("confirm15") else "✗"}\n'
+                   + " · ".join(s["reasons"][:3])),
+            inline=False)
+    embed.set_footer(text=("Chart = pair teratas. " if CHART_ENABLED else "") + "Skor teknikal bukan probabilitas profit. Tidak ada order otomatis.")
+    return embed
+
+
+async def chart_kwargs(s, embed):
+    """Kembalikan kwargs send(): embed + file chart. Jika render gagal, kirim embed saja."""
+    if not CHART_ENABLED or s.get("chart_df") is None:
+        return {"embed": embed}
+    try:
+        png = await asyncio.to_thread(render_chart, s)
+    except Exception:
+        log.exception("Render chart gagal untuk %s", s.get("symbol"))
+        return {"embed": embed}
+    fname = f'{s["symbol"]}_{s["timeframe"]}m.png'
+    embed.set_image(url=f"attachment://{fname}")
+    return {"embed": embed, "file": discord.File(io.BytesIO(png), filename=fname)}
 
 
 async def scan_once(limit=MAX_SCAN_SYMBOLS):
@@ -150,8 +198,18 @@ async def scan_once(limit=MAX_SCAN_SYMBOLS):
                     return None
         jobs = [one(t, tf) for t in candidates[:limit] for tf in SCAN_TIMEFRAMES]
         raw = await asyncio.gather(*jobs)
-        results = [s for s in raw if s and s["score"] >= MIN_SIGNAL_SCORE]
-        return sorted(results, key=lambda s: (s["score"], s.get("turnover24h", 0)), reverse=True)
+        found = [s for s in raw if s]
+        results = []
+        for s in found:
+            tier = classify(s)
+            if tier:
+                s["tier"] = tier
+                results.append(s)
+        results.sort(key=lambda s: (s["tier"] == "SIGNAL", s["score"], s.get("turnover24h", 0)), reverse=True)
+        log.info("Scan: %d kandidat likuid, %d lolos filter dasar (tren 30m searah), skor tertinggi=%s, SIGNAL=%d, WATCH=%d",
+                 len(candidates), len(found), max((s["score"] for s in found), default="-"),
+                 sum(s["tier"] == "SIGNAL" for s in results), sum(s["tier"] == "WATCH" for s in results))
+        return results
 
 
 async def evaluate_open_signals():
@@ -202,6 +260,29 @@ async def evaluate_open_signals():
             log.warning("Evaluator gagal untuk signal %s: %s", sid, exc)
 
 
+_alert_warned = False
+
+
+async def get_alert_channel():
+    global _alert_warned
+    if not ALERT_CHANNEL_ID.isdigit():
+        if not _alert_warned:
+            log.warning("ALERT_CHANNEL_ID belum diisi/valid; notifikasi otomatis tidak dikirim.")
+            _alert_warned = True
+        return None
+    cid = int(ALERT_CHANNEL_ID)
+    channel = bot.get_channel(cid)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(cid)
+        except discord.HTTPException:
+            if not _alert_warned:
+                log.warning("Channel alert %s tidak ditemukan/tidak bisa diakses bot (cek ID & izin View Channel).", cid)
+                _alert_warned = True
+            return None
+    return channel
+
+
 @tasks.loop(seconds=60)
 async def scheduled_scan():
     if not market or not db:
@@ -211,16 +292,33 @@ async def scheduled_scan():
     try:
         results = await scan_once()
         await evaluate_open_signals()
-        channel_id = int(ALERT_CHANNEL_ID) if ALERT_CHANNEL_ID.isdigit() else None
-        channel = bot.get_channel(channel_id) if channel_id else None
-        if channel:
-            sent = 0
-            for s in results:
-                if sent >= 5:
-                    break
-                if await store_signal(s):
-                    await channel.send(embed=signal_embed(s))
-                    sent += 1
+        channel = await get_alert_channel()
+        if not channel:
+            return
+        mention = f"<@&{ALERT_ROLE_ID}>" if ALERT_ROLE_ID.isdigit() else None  # ping hanya di pesan pertama
+        sent_keys, sent = set(), 0
+        for s in results:
+            if s["tier"] != "SIGNAL":
+                continue
+            if sent >= 5:
+                break
+            if await store_signal(s):
+                kw = await chart_kwargs(s, signal_embed(s))
+                await channel.send(content=mention, **kw)
+                mention = None
+                sent_keys.add((s["symbol"], s["direction"]))
+                sent += 1
+        fresh = []
+        for s in results:
+            if len(fresh) >= WATCH_MAX_PER_SCAN:
+                break
+            if s["tier"] != "WATCH" or (s["symbol"], s["direction"]) in sent_keys:
+                continue
+            if await db.claim_watch(s, WATCH_COOLDOWN_MINUTES):
+                fresh.append(s)
+        if fresh:
+            kw = await chart_kwargs(fresh[0], watch_embed(fresh))
+            await channel.send(content=mention, **kw)
     except Exception:
         log.exception("Scheduled scan error")
 
@@ -260,7 +358,7 @@ async def status(interaction: discord.Interaction):
         await interaction.followup.send(
             f"✅ Bot aktif · Pair linear terdeteksi: **{len(tickers)}**\n"
             f"TF aktif: **{', '.join(SCAN_TIMEFRAMES)} menit** · Interval scan: **{SCAN_INTERVAL_SECONDS}s**\n"
-            f"Batas pair per scan: **{MAX_SCAN_SYMBOLS}** · Sinyal minimum: **{MIN_SIGNAL_SCORE}/100**\n"
+            f"Batas pair per scan: **{MAX_SCAN_SYMBOLS}** · Sinyal minimum: **{MIN_SIGNAL_SCORE}/100** · Watch minimum: **{MIN_WATCH_SCORE}/100**\n"
             "Data: Bybit public API · Mode: sinyal saja, tanpa eksekusi order.", ephemeral=True)
     except Exception as e:
         await interaction.followup.send(f"Market data belum tersedia: {e}", ephemeral=True)
@@ -280,7 +378,8 @@ async def signal(interaction: discord.Interaction, pair: str, timeframe: app_com
         if not s:
             await interaction.followup.send(f"{symbol}: setup tidak memenuhi konfirmasi/likuiditas pada TF {timeframe.value}m. **NO TRADE**.")
         else:
-            await interaction.followup.send(embed=signal_embed(s))
+            s["tier"] = classify(s)
+            await interaction.followup.send(**await chart_kwargs(s, signal_embed(s)))
     except Exception as e:
         log.exception("Signal command error")
         await interaction.followup.send(f"Gagal menganalisis {symbol}: {e}")
@@ -293,13 +392,13 @@ async def scanner(interaction: discord.Interaction, jumlah: app_commands.Range[i
     try:
         results = await scan_once()
         if not results:
-            await interaction.followup.send("Tidak ada setup yang lolos semua filter. **NO TRADE**."); return
+            await interaction.followup.send(f"Tidak ada setup dengan skor ≥ {MIN_WATCH_SCORE} yang lolos filter (tren 30m, spread, volatilitas). **NO TRADE**."); return
         embed = discord.Embed(title="Bybit USDT Perpetual · Short-term Scanner", color=discord.Color.blurple(), timestamp=datetime.now(timezone.utc))
         for s in results[:jumlah]:
-            embed.add_field(name=f'{s["symbol"]} · {s["direction"]} · {s["score"]}/100',
+            embed.add_field(name=f'{"✅ SIGNAL" if s["tier"] == "SIGNAL" else "👀 WATCH"} · {s["symbol"]} · {s["direction"]} · {s["score"]}/100',
                 value=f'TF {s["timeframe"]}m | Entry {fmt_price(s["entry"])} | SL {fmt_price(s["sl"])} | TP {fmt_price(s["tp"])} | RR 1:{s["rr"]:.2f} | spread {s["spread_pct"]:.3f}%', inline=False)
-        embed.set_footer(text="Skor teknikal bukan probabilitas profit; level referensi, bukan jaminan fill.")
-        await interaction.followup.send(embed=embed)
+        embed.set_footer(text="Skor teknikal bukan probabilitas profit; level referensi, bukan jaminan fill." + (" Chart = setup teratas." if CHART_ENABLED else ""))
+        await interaction.followup.send(**await chart_kwargs(results[0], embed))
     except Exception as e:
         log.exception("Scanner error"); await interaction.followup.send(f"Scanner gagal: {e}")
 

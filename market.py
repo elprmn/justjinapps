@@ -298,10 +298,12 @@ async def analyze_symbol(client: BybitMarket, symbol: str, entry_tf: str = "5", 
     award(bull30, 17, "LONG", "Tren utama 30m bullish")
     award(bear30, 17, "SHORT", "Tren utama 30m bearish")
 
-    if bull30 and bull15 and long_score >= short_score + 15:
-        direction, score, reasons = "LONG", min(100, long_score), long_reasons
-    elif bear30 and bear15 and short_score >= long_score + 15:
-        direction, score, reasons = "SHORT", min(100, short_score), short_reasons
+    # Tren 30m wajib searah. Konfirmasi 15m tidak lagi wajib di sini, tapi dicatat di
+    # `confirm15`: bot.py memakainya untuk membedakan SIGNAL (terkonfirmasi) dan WATCH (indikasi awal).
+    if bull30 and long_score >= short_score + 15:
+        direction, score, reasons, confirm15 = "LONG", min(100, long_score), long_reasons, bool(bull15)
+    elif bear30 and short_score >= long_score + 15:
+        direction, score, reasons, confirm15 = "SHORT", min(100, short_score), short_reasons, bool(bear15)
     else:
         return None
 
@@ -329,5 +331,6 @@ async def analyze_symbol(client: BybitMarket, symbol: str, entry_tf: str = "5", 
         "score": int(score), "entry": price, "sl": float(sl), "tp": float(tp),
         "rr": 1.8, "reasons": reasons, "candle_start": int(e["start"]),
         "spread_pct": spread_pct, "turnover24h": turnover, "atr_pct": atr_pct,
-        "funding_pct": funding_pct,
+        "funding_pct": funding_pct, "confirm15": confirm15,
+        "chart_df": frames[entry_tf].tail(150).copy(),  # dipakai chart.py; tidak disimpan ke Redis
     }

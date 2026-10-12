@@ -85,3 +85,16 @@ Discord slash-command bot for Bybit linear USDT perpetual public market data. It
 - Bybit memblokir IP/region tertentu (termasuk banyak IP datacenter AS). Pindahkan service ke region **Singapore (Southeast Asia)** di Railway → Service → Settings → Deploy → Region, lalu redeploy.
 - Bot otomatis mencoba host cadangan `api.bytick.com`. Host bisa diganti dengan `BYBIT_REST_URLS` (pisah koma) dan `BYBIT_WS_URL` (opsional).
 - Saat diblok, bot memakai backoff (5s → maks 300s) sehingga tidak membanjiri API.
+
+### Tingkat notifikasi: SIGNAL vs WATCH
+- **SIGNAL**: tren 30m dan momentum 15m searah, skor >= `MIN_SIGNAL_SCORE`. Disimpan ke Redis, dievaluasi TP/SL, masuk `/performance`.
+- **WATCH**: tren 30m searah dengan skor >= `MIN_WATCH_SCORE` tetapi belum SIGNAL penuh (mis. belum breakout / 15m belum searah). Hanya notifikasi, **tidak** masuk statistik. Satu embed per scan, cooldown per pair+arah `WATCH_COOLDOWN_MINUTES`.
+- Skor maksimum yang bisa dicapai adalah 80. `MIN_SIGNAL_SCORE=75` praktis hanya lolos jika ada breakout 20 candle + volume + RSI ideal sekaligus, sehingga sangat jarang. Untuk SIGNAL tanpa breakout, nilai sekitar 65 lebih realistis (cek hasilnya di `/performance` sebelum dipercaya).
+- Log tiap scan menampilkan jumlah kandidat, skor tertinggi, dan jumlah SIGNAL/WATCH untuk membantu tuning.
+- Isi `ALERT_CHANNEL_ID` (wajib untuk notifikasi otomatis) dan opsional `ALERT_ROLE_ID` untuk ping role.
+
+### Chart di embed
+- Setiap notifikasi SIGNAL, `/signal`, dan `/scanner` (setup teratas) melampirkan gambar candlestick dengan garis **Entry**, **SL**, **TP**, zona risk/reward, EMA20/EMA50, dan volume.
+- WATCH menampilkan chart untuk pair dengan skor tertinggi pada pesan tersebut.
+- Env: `CHART_ENABLED` (1/0), `CHART_CANDLES` (jumlah candle, 30-200), `CHART_TZ` (zona waktu label, default `Asia/Jakarta`).
+- Chart dirender di thread terpisah (~0,3 detik). Jika render gagal, embed teks tetap terkirim. Bot perlu izin **Attach Files** di channel alert.
