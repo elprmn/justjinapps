@@ -51,9 +51,9 @@ def render_chart(s: dict) -> bytes:
     is_long = s["direction"] == "LONG"
     tz, tz_name = _tz()
 
-    fig = Figure(figsize=(10, 5.8), dpi=100, facecolor=BG)
+    fig = Figure(figsize=(9, 4.1), dpi=100, facecolor=BG)  # pendek: hemat tinggi embed Discord
     gs = fig.add_gridspec(2, 1, height_ratios=[5, 1], hspace=0.04,
-                          left=0.045, right=0.915, top=0.885, bottom=0.075)
+                          left=0.045, right=0.915, top=0.835, bottom=0.085)
     ax = fig.add_subplot(gs[0])
     axv = fig.add_subplot(gs[1], sharex=ax)
     for a in (ax, axv):
@@ -140,12 +140,12 @@ def render_chart(s: dict) -> bytes:
     side_color = UP if is_long else DOWN
     tier = s.get("tier")
     tier_txt = {"SIGNAL": "SIGNAL", "WATCH": "WATCH"}.get(tier, "")
-    fig.text(0.045, 0.945, f'{s["symbol"]}  ·  {s["direction"]}', color=side_color, fontsize=15, fontweight="bold", va="center")
-    sub = f'TF {s["timeframe"]}m  ·  skor {s["score"]}/100  ·  RR 1:{s["rr"]:.2f}'
+    fig.text(0.045, 0.935, f'{s["symbol"]}  ·  {s["direction"]}', color=side_color, fontsize=14, fontweight="bold", va="center")
+    sub = f'TF {s["timeframe"]}m  ·  skor {s["score"]}/100  ·  RR 1:{s["rr"]:g}'
     if tier_txt:
         sub += f"  ·  {tier_txt}"
-    fig.text(0.045, 0.905, sub, color=TEXT, fontsize=9, va="center")
-    fig.text(0.915, 0.945, f"Bybit USDT Perp · {tz_name}", color="#7d8590", fontsize=8, ha="right", va="center")
+    fig.text(0.045, 0.875, sub, color=TEXT, fontsize=9, va="center")
+    fig.text(0.915, 0.935, f"Bybit USDT Perp · {tz_name}", color="#7d8590", fontsize=8, ha="right", va="center")
 
     buf = io.BytesIO()
     with _render_lock:

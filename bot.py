@@ -10,7 +10,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from market import BybitMarket, analyze_symbol, fmt_price, INTERVALS
+from market import BybitMarket, analyze_symbol, fmt_price, INTERVALS, FEE_PCT, MAX_SPREAD_PCT
 from chart import render_chart, CHART_ENABLED
 
 logging.basicConfig(level=logging.INFO)
@@ -20,20 +20,22 @@ GUILD_ID = os.getenv("GUILD_ID", "").strip().strip("\"\'").strip()
 ALERT_CHANNEL_ID = os.getenv("ALERT_CHANNEL_ID", "").strip().strip("\"\'").strip()
 SCAN_INTERVAL_SECONDS = max(60, int(os.getenv("SCAN_INTERVAL_SECONDS", "120")))
 MAX_SCAN_SYMBOLS = max(5, min(60, int(os.getenv("MAX_SCAN_SYMBOLS", "25"))))
-MIN_SIGNAL_SCORE = max(50, min(100, int(os.getenv("MIN_SIGNAL_SCORE", "75"))))
+MIN_SIGNAL_SCORE = max(50, min(100, int(os.getenv("MIN_SIGNAL_SCORE", "70"))))
 MIN_TURNOVER_24H = max(1_000_000, float(os.getenv("MIN_TURNOVER_24H", "5000000")))
-SCAN_TIMEFRAMES = tuple(x.strip() for x in os.getenv("SCAN_TIMEFRAMES", "5,15,30").split(",") if x.strip() in INTERVALS)
+SCAN_TIMEFRAMES = tuple(x.strip() for x in os.getenv("SCAN_TIMEFRAMES", "5,15").split(",") if x.strip() in INTERVALS)
 SIGNAL_MAX_AGE_MINUTES = max(30, int(os.getenv("SIGNAL_MAX_AGE_MINUTES", "180")))
 COOLDOWN_MINUTES = max(5, int(os.getenv("COOLDOWN_MINUTES", "30")))
 # WATCH = indikasi awal long/short (tren 30m searah, skor >= MIN_WATCH_SCORE) walau belum jadi SIGNAL penuh.
 MIN_WATCH_SCORE = max(40, min(MIN_SIGNAL_SCORE, int(os.getenv("MIN_WATCH_SCORE", "55"))))
 WATCH_COOLDOWN_MINUTES = max(5, int(os.getenv("WATCH_COOLDOWN_MINUTES", "30")))
 WATCH_MAX_PER_SCAN = max(1, min(10, int(os.getenv("WATCH_MAX_PER_SCAN", "5"))))
+WATCH_CHART = os.getenv("WATCH_CHART", "0").strip().lower() in ("1", "true", "yes", "on")  # chart di embed WATCH (default mati: hemat halaman)
+FOLLOW_MAX_DRIFT_R = float(os.getenv("FOLLOW_MAX_DRIFT_R", "0.5"))  # tolak ikut jika harga sudah +X R menuju TP (terlambat)
 ALERT_ROLE_ID = os.getenv("ALERT_ROLE_ID", "").strip().strip("\"\'").strip()  # opsional: role yang di-ping
 if not DISCORD_TOKEN:
     raise RuntimeError("DISCORD_TOKEN belum diisi pada environment variables.")
 if not SCAN_TIMEFRAMES:
-    SCAN_TIMEFRAMES = ("5", "15", "30")
+    SCAN_TIMEFRAMES = ("5", "15")
 
 intents = discord.Intents.default()
 market: Optional[BybitMarket] = None
@@ -45,6 +47,7 @@ class SignalBot(commands.Bot):
     async def setup_hook(self):
         # Slash command DISYNC PERTAMA, sebelum Redis/Bybit, supaya kegagalan
         # layanan lain tidak membuat command hilang dari Discord.
+        self.add_dynamic_items(FollowButton, HistoryButton)  # tombol persisten: tetap hidup setelah restart/redeploy
         await sync_commands()
         await start_services()
         if not scheduled_scan.is_running():
@@ -108,57 +111,73 @@ async def start_services():
             log.exception("Redis belum terhubung (cek REDIS_URL / reference variable Railway). Akan dicoba lagi.")
 
 
-async def store_signal(s):
-    return await db.add_signal(s, COOLDOWN_MINUTES)
+# ============================================================ helper tampilan
+OUTCOME_ICON = {"TP": "✅", "SL": "❌", "AMBIGUOUS": "⚠️", "EXPIRED": "⌛", "OPEN": "⏳"}
+OUTCOME_LABEL = {"TP": "TP", "SL": "SL", "AMBIGUOUS": "Ambigu (dihitung loss)", "EXPIRED": "Kedaluwarsa"}
+
+
+def _pct(a, b):
+    return abs(a - b) / b * 100 if b else 0.0
+
+
+def _ts(iso):
+    try:
+        return int(datetime.fromisoformat(iso).timestamp())
+    except (TypeError, ValueError):
+        return 0
 
 
 def classify(s):
-    """SIGNAL = tren 30m + momentum 15m searah dan skor >= MIN_SIGNAL_SCORE; WATCH = indikasi awal."""
-    if s.get("confirm15") and s["score"] >= MIN_SIGNAL_SCORE:
+    """SIGNAL = pullback + candle konfirmasi sudah close (stage TRIGGER); WATCH = pullback aktif, belum konfirmasi."""
+    if s.get("stage") == "TRIGGER" and s["score"] >= MIN_SIGNAL_SCORE:
         return "SIGNAL"
     if s["score"] >= MIN_WATCH_SCORE:
         return "WATCH"
     return None
 
 
-def signal_embed(s):
+def footer_text(sid, status, followers):
+    left = f"#{sid} · " if sid else "Cek manual · "
+    return f"{left}{status} · 👥 {followers} ikut · simulasi, bukan nasihat finansial" if sid else \
+        f"{left}tanpa tombol follow · simulasi, bukan nasihat finansial"
+
+
+def signal_embed(s, sid=None, followers=0):
+    """Embed ringkas: 3 baris deskripsi, tanpa field, supaya tidak memanjang ke bawah."""
     is_long = s["direction"] == "LONG"
-    tier = classify(s)
-    status = {"SIGNAL": "✅ SIGNAL", "WATCH": "👀 WATCH (indikasi awal)"}.get(tier, "⚪ Lemah (di bawah ambang)")
-    embed = discord.Embed(title=f'{s["symbol"]} · {s["direction"]}',
-        description=f'**Status:** {status}\n**TF entry:** {s["timeframe"]}m · **Skor teknikal:** {s["score"]}/100',
-        color=discord.Color.green() if is_long else discord.Color.red(), timestamp=datetime.now(timezone.utc))
-    embed.add_field(name="Entry referensi", value=fmt_price(s["entry"]), inline=True)
-    embed.add_field(name="Stop Loss", value=fmt_price(s["sl"]), inline=True)
-    embed.add_field(name="Take Profit", value=fmt_price(s["tp"]), inline=True)
-    embed.add_field(name="Risk/Reward", value=f'1 : {s["rr"]:.2f}', inline=True)
-    embed.add_field(name="Spread", value=f'{s.get("spread_pct", 0):.3f}%', inline=True)
+    tier = s.get("tier") or classify(s)
+    dot = "🟢" if is_long else "🔴"
+    tag = {"SIGNAL": "", "WATCH": " · 👀 WATCH"}.get(tier, " · ⚪ lemah")
+    risk, reward = _pct(s["entry"], s["sl"]), _pct(s["tp"], s["entry"])
+    line2 = f'RR 1:{s["rr"]:g} · Skor {s["score"]} · Fee ≈{s.get("fee_r", 0):.2f}R · Spread {s.get("spread_pct", 0):.3f}%'
     if s.get("funding_pct") is not None:
-        embed.add_field(name="Funding rate", value=f'{s["funding_pct"]:.4f}%', inline=True)
-    embed.add_field(name="Konfirmasi", value="\n".join(f"• {x}" for x in s["reasons"][:6]), inline=False)
-    embed.set_footer(text="Sinyal simulasi/edukasi; bukan probabilitas profit. Tidak ada order otomatis.")
+        line2 += f' · Fund {s["funding_pct"]:+.3f}%'
+    desc = (f'**Entry** `{fmt_price(s["entry"])}` · **SL** `{fmt_price(s["sl"])}` (-{risk:.2f}%) · '
+            f'**TP** `{fmt_price(s["tp"])}` (+{reward:.2f}%)\n{line2}\n' + " · ".join(s["reasons"][:4]))
+    embed = discord.Embed(title=f'{dot} {s["direction"]} · {s["symbol"]} · {s["timeframe"]}m{tag}', description=desc,
+                          color=discord.Color.green() if is_long else discord.Color.red(), timestamp=datetime.now(timezone.utc))
+    embed.set_footer(text=footer_text(sid, "⏳ Berjalan", followers))
     return embed
+
+
+def _line(s, with_tier=False):
+    icon = "🟢" if s["direction"] == "LONG" else "🔴"
+    pre = ("✅ " if s.get("tier") == "SIGNAL" else "👀 ") if with_tier else ""
+    return (f'{pre}{icon} **{s["symbol"]}** {s["direction"][0]}·{s["timeframe"]}m · {s["score"]} · '
+            f'`{fmt_price(s["entry"])}` SL `{fmt_price(s["sl"])}` TP `{fmt_price(s["tp"])}`')
 
 
 def watch_embed(items):
-    embed = discord.Embed(title="👀 Setup terdeteksi (WATCH)",
-        description="Indikasi awal arah LONG/SHORT. **Belum sinyal entry penuh**; tunggu konfirmasi sebelum bertindak.",
-        color=discord.Color.gold(), timestamp=datetime.now(timezone.utc))
-    for s in items:
-        icon = "🟢" if s["direction"] == "LONG" else "🔴"
-        embed.add_field(
-            name=f'{icon} {s["symbol"]} · {s["direction"]} · TF {s["timeframe"]}m · {s["score"]}/100',
-            value=(f'Harga {fmt_price(s["entry"])} | SL ref {fmt_price(s["sl"])} | TP ref {fmt_price(s["tp"])} | '
-                   f'spread {s["spread_pct"]:.3f}% | 15m {"✓" if s.get("confirm15") else "✗"}\n'
-                   + " · ".join(s["reasons"][:3])),
-            inline=False)
-    embed.set_footer(text=("Chart = pair teratas. " if CHART_ENABLED else "") + "Skor teknikal bukan probabilitas profit. Tidak ada order otomatis.")
+    desc = "Pullback ke EMA20 terdeteksi, **belum entry** — tunggu candle konfirmasi.\n" + "\n".join(_line(s) for s in items)
+    embed = discord.Embed(title="👀 WATCH · pullback aktif", description=desc,
+                          color=discord.Color.gold(), timestamp=datetime.now(timezone.utc))
+    embed.set_footer(text="Level = referensi. Skor bukan probabilitas profit. Tanpa order otomatis.")
     return embed
 
 
-async def chart_kwargs(s, embed):
+async def chart_kwargs(s, embed, force=True):
     """Kembalikan kwargs send(): embed + file chart. Jika render gagal, kirim embed saja."""
-    if not CHART_ENABLED or s.get("chart_df") is None:
+    if not CHART_ENABLED or not force or s.get("chart_df") is None:
         return {"embed": embed}
     try:
         png = await asyncio.to_thread(render_chart, s)
@@ -168,6 +187,181 @@ async def chart_kwargs(s, embed):
     fname = f'{s["symbol"]}_{s["timeframe"]}m.png'
     embed.set_image(url=f"attachment://{fname}")
     return {"embed": embed, "file": discord.File(io.BytesIO(png), filename=fname)}
+
+
+# ============================================================ Follow Trade (tombol)
+class FollowButton(discord.ui.DynamicItem[discord.ui.Button], template=r"follow:(?P<sid>\d+)"):
+    def __init__(self, sid: int, disabled: bool = False, label: str = "Ikut Trade"):
+        super().__init__(discord.ui.Button(label=label, emoji="✅", style=discord.ButtonStyle.success,
+                                           custom_id=f"follow:{sid}", disabled=disabled))
+        self.sid = int(sid)
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match, /):
+        return cls(int(match["sid"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        await handle_follow(interaction, self.sid)
+
+
+class HistoryButton(discord.ui.DynamicItem[discord.ui.Button], template=r"fhist"):
+    def __init__(self):
+        super().__init__(discord.ui.Button(label="Riwayat Saya", emoji="📋", style=discord.ButtonStyle.secondary,
+                                           custom_id="fhist"))
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match, /):
+        return cls()
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await interaction.followup.send(embed=await build_history_embed(interaction.user, "all"), ephemeral=True)
+
+
+def make_view(sid, closed=False):
+    view = discord.ui.View(timeout=None)
+    view.add_item(FollowButton(sid, disabled=closed, label="Selesai" if closed else "Ikut Trade"))
+    view.add_item(HistoryButton())
+    return view
+
+
+async def set_message_footer(message, text, view=None, color=None):
+    """Ubah footer (status/jumlah follower) pada pesan sinyal; gagal diam-diam jika pesan tak bisa diedit."""
+    try:
+        if message is None or not message.embeds:
+            return
+        emb = message.embeds[0]
+        emb.set_footer(text=text)
+        if color is not None:
+            emb.color = color
+        kwargs = {"embed": emb}
+        if view is not None:
+            kwargs["view"] = view
+        await message.edit(**kwargs)
+    except discord.HTTPException as exc:
+        log.warning("Gagal update pesan sinyal: %s", exc)
+
+
+async def handle_follow(interaction: discord.Interaction, sid: int):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    if db is None or market is None:
+        await interaction.followup.send("Layanan belum siap, coba lagi sebentar.", ephemeral=True); return
+    row = await db.get_signal(sid)
+    if not row:
+        await interaction.followup.send("Sinyal tidak ditemukan.", ephemeral=True); return
+    if row.get("status") != "OPEN":
+        await interaction.followup.send(f'{OUTCOME_ICON.get(row.get("outcome"), "")} Sinyal #{sid} sudah selesai '
+                                        f'({OUTCOME_LABEL.get(row.get("outcome"), row.get("status"))}); tidak bisa diikuti.', ephemeral=True); return
+    uid = interaction.user.id
+    prev = await db.get_follow(sid, uid)
+    if prev:
+        await interaction.followup.send(f'Kamu sudah ikut #{sid} @ `{fmt_price(prev["follow_price"])}`. Hasil masuk `/riwayat` saat TP/SL.', ephemeral=True); return
+    entry, sl, tp, long = row["entry"], row["stop_loss"], row["take_profit"], row["direction"] == "LONG"
+    try:
+        price = float((await market.get_ticker(row["symbol"])).get("lastPrice") or 0)
+    except Exception:
+        price = 0.0
+    if price <= 0:
+        price = entry
+    crossed = (price <= sl or price >= tp) if long else (price >= sl or price <= tp)
+    if crossed:
+        await interaction.followup.send("Harga sudah menyentuh level TP/SL; sinyal akan segera ditutup. Tidak bisa ikut.", ephemeral=True); return
+    risk = abs(entry - sl) or 1e-12
+    drift_r = ((price - entry) if long else (entry - price)) / risk
+    if drift_r >= FOLLOW_MAX_DRIFT_R:
+        await interaction.followup.send(f"Terlambat: harga sudah {drift_r:+.2f}R menuju TP dari entry sinyal. Tunggu sinyal berikutnya.", ephemeral=True); return
+    rec = await db.add_follow(sid, uid, interaction.user.display_name, row, price)
+    if rec is None:
+        await interaction.followup.send("Kamu sudah ikut sinyal ini.", ephemeral=True); return
+    n = await db.count_followers(sid)
+    note = f"\nHarga sudah bergeser {drift_r:+.2f}R dari entry sinyal; R-mu dihitung dari harga ini." if abs(drift_r) >= 0.1 else ""
+    await interaction.followup.send(
+        f'✅ Ikut **#{sid} {row["symbol"]} {row["direction"]} {row["timeframe"]}m**\n'
+        f'Masuk `{fmt_price(price)}` · SL `{fmt_price(sl)}` · TP `{fmt_price(tp)}`{note}\n'
+        f'Hasil dicatat otomatis saat kena TP/SL → `/riwayat`', ephemeral=True)
+    await set_message_footer(interaction.message, footer_text(sid, "⏳ Berjalan", n))
+
+
+async def build_history_embed(user, mode="all"):
+    recs = await db.user_follows(user.id, 200)
+    open_ = [r for r in recs if r["status"] == "OPEN"]
+    closed = [r for r in recs if r["status"] != "OPEN"]
+    wins = sum((r.get("net_r") or 0) > 0 for r in closed)
+    net = sum(r.get("net_r") or 0 for r in closed)
+    wr = wins / len(closed) * 100 if closed else 0
+    shown = {"open": open_, "closed": closed}.get(mode, recs)[:12]
+    lines = []
+    for r in shown:
+        side = r["direction"][0]
+        if r["status"] == "OPEN":
+            lines.append(f'⏳ **{r["symbol"]}** {side}·{r["timeframe"]}m · #{r["signal_id"]} @ `{fmt_price(r["follow_price"])}` · <t:{_ts(r["followed_at"])}:R>')
+        else:
+            lines.append(f'{OUTCOME_ICON.get(r["status"], "")} **{r["symbol"]}** {side}·{r["timeframe"]}m · {r["status"]} · '
+                         f'**{(r.get("net_r") or 0):+.2f}R** · <t:{_ts(r["closed_at"])}:R>')
+    head = (f'Selesai **{len(closed)}** · Win **{wins}** · Loss **{len(closed) - wins}** · WR **{wr:.0f}%** · Net **{net:+.2f}R**'
+            f' · Berjalan **{len(open_)}**')
+    desc = head + "\n\n" + ("\n".join(lines) if lines else "_Belum ada trade. Tekan **Ikut Trade** pada sinyal baru._")
+    embed = discord.Embed(title=f"📋 Riwayat Follow · {user.display_name}", description=desc[:4000], color=discord.Color.blurple())
+    embed.set_footer(text=f"Net = setelah fee ≈{FEE_PCT:g}% pulang-pergi. Simulasi, bukan order nyata. Menampilkan {len(shown)} terbaru.")
+    return embed
+
+
+async def settle_follows(sig, outcome, close_price, closed_at):
+    """Hitung hasil tiap follower dari harga masuk mereka sendiri. Mengembalikan daftar follower yang dituntaskan."""
+    sid, long = sig["id"], sig["direction"] == "LONG"
+    sl, tp = sig["stop_loss"], sig["take_profit"]
+    done = []
+    for f in await db.followers_of(sid):
+        if f.get("status") != "OPEN":
+            continue
+        fp = f["follow_price"]
+        risk = abs(fp - sl) or abs(sig["entry"] - sl) or 1e-12
+        if outcome == "TP":
+            gross = ((tp - fp) if long else (fp - tp)) / risk
+        elif outcome in ("SL", "AMBIGUOUS"):
+            gross = -1.0
+        else:  # EXPIRED: tutup di harga terakhir
+            gross = ((close_price - fp) if long else (fp - close_price)) / risk
+        fee_r = FEE_PCT / (risk / fp * 100) if fp else 0.0
+        rec = await db.update_follow(sid, f["user_id"], status=outcome, result_r=gross, net_r=gross - fee_r,
+                                     close_price=close_price, closed_at=closed_at)
+        if rec:
+            done.append(rec)
+    return done
+
+
+async def announce_close(sig, outcome, gross, net, followers):
+    """Update pesan sinyal (status + tombol nonaktif) dan mention follower dengan hasilnya."""
+    channel = await get_alert_channel()
+    if not channel:
+        return
+    msg = None
+    if sig.get("message_id"):
+        try:
+            msg = await channel.fetch_message(int(sig["message_id"]))
+        except discord.HTTPException:
+            msg = None
+    n = await db.count_followers(sig["id"])
+    label = OUTCOME_LABEL.get(outcome, outcome)
+    await set_message_footer(msg, f'#{sig["id"]} · {OUTCOME_ICON.get(outcome, "")} {label} · {gross:+.2f}R (net {net:+.2f}R) · 👥 {n} ikut',
+                             view=make_view(sig["id"], closed=True), color=discord.Color.dark_grey())
+    if followers:
+        mentions = " ".join(f'<@{f["user_id"]}>' for f in followers[:25])
+        text = (f'{OUTCOME_ICON.get(outcome, "")} **#{sig["id"]} {sig["symbol"]} {sig["direction"]}** selesai: **{label}** · '
+                f'{gross:+.2f}R · cek `/riwayat`\n{mentions}')
+        allowed = discord.AllowedMentions(users=True, roles=False, everyone=False)
+        try:
+            if msg is not None:
+                await msg.reply(text, allowed_mentions=allowed)
+            else:
+                await channel.send(text, allowed_mentions=allowed)
+        except discord.HTTPException as exc:
+            log.warning("Gagal kirim notifikasi hasil #%s: %s", sig["id"], exc)
+
+
+# ============================================================ scan & evaluasi
+async def store_signal(s):
+    return await db.add_signal(s, COOLDOWN_MINUTES)
 
 
 async def scan_once(limit=MAX_SCAN_SYMBOLS):
@@ -184,11 +378,11 @@ async def scan_once(limit=MAX_SCAN_SYMBOLS):
                 spread = ((ask-bid)/((ask+bid)/2)*100) if bid > 0 and ask >= bid else 999
             except (ValueError, TypeError, ZeroDivisionError):
                 continue
-            if turnover >= MIN_TURNOVER_24H and spread <= 0.15:
+            if turnover >= MIN_TURNOVER_24H and spread <= MAX_SPREAD_PCT:
                 candidates.append(t)
         candidates.sort(key=lambda t: float(t.get("turnover24h", 0) or 0), reverse=True)
-        # Bounded concurrency prevents flooding the public REST API.
-        sem = asyncio.Semaphore(5)
+        sem = asyncio.Semaphore(5)  # bounded concurrency agar REST publik tidak dibanjiri
+
         async def one(ticker, tf):
             async with sem:
                 try:
@@ -196,8 +390,7 @@ async def scan_once(limit=MAX_SCAN_SYMBOLS):
                 except Exception as exc:
                     log.warning("Analisis %s TF%s gagal: %s", ticker.get("symbol"), tf, exc)
                     return None
-        jobs = [one(t, tf) for t in candidates[:limit] for tf in SCAN_TIMEFRAMES]
-        raw = await asyncio.gather(*jobs)
+        raw = await asyncio.gather(*[one(t, tf) for t in candidates[:limit] for tf in SCAN_TIMEFRAMES])
         found = [s for s in raw if s]
         results = []
         for s in found:
@@ -206,56 +399,67 @@ async def scan_once(limit=MAX_SCAN_SYMBOLS):
                 s["tier"] = tier
                 results.append(s)
         results.sort(key=lambda s: (s["tier"] == "SIGNAL", s["score"], s.get("turnover24h", 0)), reverse=True)
-        log.info("Scan: %d kandidat likuid, %d lolos filter dasar (tren 30m searah), skor tertinggi=%s, SIGNAL=%d, WATCH=%d",
+        log.info("Scan: %d kandidat likuid, %d setup tren+pullback, skor tertinggi=%s, SIGNAL=%d, WATCH=%d",
                  len(candidates), len(found), max((s["score"] for s in found), default="-"),
                  sum(s["tier"] == "SIGNAL" for s in results), sum(s["tier"] == "WATCH" for s in results))
         return results
 
 
+def resolve_outcome(direction, sl, tp, candles):
+    """TP/SL pertama yang tersentuh; keduanya di candle yang sama => AMBIGUOUS."""
+    for _, c in candles.iterrows():
+        high, low = float(c["high"]), float(c["low"])
+        hit_sl = low <= sl if direction == "LONG" else high >= sl
+        hit_tp = high >= tp if direction == "LONG" else low <= tp
+        if hit_sl and hit_tp:
+            return "AMBIGUOUS", float(c["close"])
+        if hit_sl:
+            return "SL", sl
+        if hit_tp:
+            return "TP", tp
+    return None, None
+
+
+def signal_result_r(sig, outcome, close_price):
+    """(gross_r, fee_r, net_r). AMBIGUOUS dihitung -1R (asumsi konservatif)."""
+    entry, sl = sig["entry"], sig["stop_loss"]
+    long = sig["direction"] == "LONG"
+    risk = abs(entry - sl) or 1e-12
+    if outcome == "TP":
+        gross = abs(sig["take_profit"] - entry) / risk
+    elif outcome in ("SL", "AMBIGUOUS"):
+        gross = -1.0
+    else:
+        gross = ((close_price - entry) if long else (entry - close_price)) / risk
+    risk_pct = risk / entry * 100
+    fee_r = FEE_PCT / risk_pct if risk_pct else 0.0
+    return gross, fee_r, gross - fee_r
+
+
 async def evaluate_open_signals():
-    """Resolve signal outcomes using closed candles; same-candle TP+SL is ambiguous."""
     rows = await db.get_open_signals(40)
     now = datetime.now(timezone.utc)
     for row in rows:
-        sid, symbol, tf, direction = row["id"], row["symbol"], row["timeframe"], row["direction"]
-        entry, sl, tp = row["entry"], row["stop_loss"], row["take_profit"]
-        candle_start, created_at = row.get("candle_start"), row["created_at"]
+        sid, symbol, tf = row["id"], row["symbol"], row["timeframe"]
         try:
-            df = await market.get_klines(symbol, tf, 100)
+            df = await market.get_klines_cached(symbol, tf, ttl=20)
             if df.empty:
                 continue
-            after = df[df["start"] > (candle_start or 0)]
+            after = df[df["start"] > (row.get("candle_start") or 0)]
             if after.empty:
                 continue
-            outcome = None; close_price = None; result_r = None
-            for _, c in after.iterrows():
-                high, low = float(c["high"]), float(c["low"])
-                if direction == "LONG":
-                    hit_sl, hit_tp = low <= sl, high >= tp
-                    risk = entry - sl
-                    if hit_sl and hit_tp:
-                        outcome, close_price = "AMBIGUOUS", float(c["close"]); break
-                    if hit_sl:
-                        outcome, close_price, result_r = "SL", sl, -1.0; break
-                    if hit_tp:
-                        outcome, close_price, result_r = "TP", tp, (tp-entry)/risk; break
-                else:
-                    hit_sl, hit_tp = high >= sl, low <= tp
-                    risk = sl - entry
-                    if hit_sl and hit_tp:
-                        outcome, close_price = "AMBIGUOUS", float(c["close"]); break
-                    if hit_sl:
-                        outcome, close_price, result_r = "SL", sl, -1.0; break
-                    if hit_tp:
-                        outcome, close_price, result_r = "TP", tp, (entry-tp)/risk; break
-            age_minutes = (now - datetime.fromisoformat(created_at)).total_seconds()/60
+            outcome, close_price = resolve_outcome(row["direction"], row["stop_loss"], row["take_profit"], after)
+            age_minutes = (now - datetime.fromisoformat(row["created_at"])).total_seconds() / 60
             if outcome is None and age_minutes >= SIGNAL_MAX_AGE_MINUTES:
                 outcome, close_price = "EXPIRED", float(after.iloc[-1]["close"])
-                risk = (entry-sl) if direction == "LONG" else (sl-entry)
-                result_r = ((close_price-entry)/risk if direction == "LONG" else (entry-close_price)/risk)
-            if outcome:
-                await db.update_signal(sid, status=outcome, outcome=outcome, closed_at=now.isoformat(),
-                                       close_price=close_price, result_r=result_r)
+            if not outcome:
+                continue
+            gross, fee_r, net = signal_result_r(row, outcome, close_price)
+            closed_at = now.isoformat()
+            sig = await db.update_signal(sid, status=outcome, outcome=outcome, closed_at=closed_at,
+                                         close_price=close_price, result_r=gross, fee_r=fee_r, net_r=net) or row
+            followers = await settle_follows(sig, outcome, close_price, closed_at)
+            await announce_close(sig, outcome, gross, net, followers)
         except Exception as exc:
             log.warning("Evaluator gagal untuk signal %s: %s", sid, exc)
 
@@ -283,17 +487,56 @@ async def get_alert_channel():
     return channel
 
 
+scan_state = {"at": None, "found": 0, "signals": 0, "watch": 0, "sent": 0, "watch_sent": 0, "error": None}
+
+
+def _alert_problem():
+    """Alasan alert otomatis tidak bisa jalan sekarang (None = siap)."""
+    if market is None:
+        return "market data belum aktif"
+    if db is None:
+        return "Redis belum terhubung (cek REDIS_URL / reference variable Railway)"
+    if not ALERT_CHANNEL_ID.isdigit():
+        return "ALERT_CHANNEL_ID belum diisi / bukan angka"
+    return None
+
+
+def _missing_perms(channel):
+    """Izin yang kurang pada channel alert (kosong = lengkap)."""
+    try:
+        me = channel.guild.me
+        p = channel.permissions_for(me)
+        need = {"view_channel": "View Channel", "send_messages": "Send Messages", "embed_links": "Embed Links",
+                "attach_files": "Attach Files", "read_message_history": "Read Message History"}
+        return [label for attr, label in need.items() if not getattr(p, attr, True)]
+    except Exception:
+        return []
+
+
 @tasks.loop(seconds=60)
 async def scheduled_scan():
     if not market or not db:
         await start_services()
-        if not market or not db:
-            return
+    problem = _alert_problem()
+    if problem:
+        scan_state.update(at=datetime.now(timezone.utc), error=problem)
+        log.warning("Alert otomatis TIDAK jalan: %s", problem)
+        return
     try:
         results = await scan_once()
         await evaluate_open_signals()
         channel = await get_alert_channel()
+        n_sig = sum(s["tier"] == "SIGNAL" for s in results)
+        n_watch = sum(s["tier"] == "WATCH" for s in results)
+        scan_state.update(at=datetime.now(timezone.utc), found=len(results), signals=n_sig, watch=n_watch,
+                          sent=0, watch_sent=0, error=None)
         if not channel:
+            scan_state["error"] = "channel alert tidak ditemukan / bot tidak bisa mengaksesnya"
+            return
+        missing = _missing_perms(channel)
+        if missing:
+            scan_state["error"] = "bot kekurangan izin di channel alert: " + ", ".join(missing)
+            log.warning("Alert otomatis TIDAK jalan: %s", scan_state["error"])
             return
         mention = f"<@&{ALERT_ROLE_ID}>" if ALERT_ROLE_ID.isdigit() else None  # ping hanya di pesan pertama
         sent_keys, sent = set(), 0
@@ -302,12 +545,24 @@ async def scheduled_scan():
                 continue
             if sent >= 5:
                 break
-            if await store_signal(s):
-                kw = await chart_kwargs(s, signal_embed(s))
-                await channel.send(content=mention, **kw)
-                mention = None
-                sent_keys.add((s["symbol"], s["direction"]))
-                sent += 1
+            sid = await store_signal(s)
+            if not sid:
+                continue
+            try:
+                s["id"] = sid
+                kw = await chart_kwargs(s, signal_embed(s, sid))
+                msg = await channel.send(content=mention, view=make_view(sid), **kw)
+            except Exception as exc:
+                # Gagal kirim: batalkan penyimpanan agar sinyal dicoba lagi di scan berikutnya, bukan hilang diam-diam.
+                await db.discard_signal(sid)
+                scan_state["error"] = f"gagal kirim sinyal {s['symbol']}: {exc}"
+                log.exception("Gagal kirim sinyal %s; penyimpanan dibatalkan", s["symbol"])
+                break
+            await db.update_signal(sid, channel_id=channel.id, message_id=msg.id)
+            mention = None
+            sent_keys.add((s["symbol"], s["direction"]))
+            sent += 1
+        scan_state["sent"] = sent
         fresh = []
         for s in results:
             if len(fresh) >= WATCH_MAX_PER_SCAN:
@@ -317,9 +572,12 @@ async def scheduled_scan():
             if await db.claim_watch(s, WATCH_COOLDOWN_MINUTES):
                 fresh.append(s)
         if fresh:
-            kw = await chart_kwargs(fresh[0], watch_embed(fresh))
+            kw = await chart_kwargs(fresh[0], watch_embed(fresh), force=WATCH_CHART)
             await channel.send(content=mention, **kw)
-    except Exception:
+            scan_state["watch_sent"] = len(fresh)
+        log.info("Alert: SIGNAL terkirim=%d, WATCH terkirim=%d", sent, len(fresh))
+    except Exception as exc:
+        scan_state["error"] = f"error scan: {exc}"
         log.exception("Scheduled scan error")
 
 
@@ -350,16 +608,37 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         pass
 
 
+# ============================================================ slash commands
+async def alert_diagnostics():
+    """Ringkasan kesehatan alert otomatis untuk /status."""
+    lines = ["**Alert otomatis**"]
+    lines.append(f"Redis: {'✅ terhubung' if db else '❌ belum terhubung'}")
+    ch = await get_alert_channel() if ALERT_CHANNEL_ID.isdigit() else None
+    if ch is None:
+        lines.append("Channel alert: ❌ tidak valid / tidak bisa diakses (cek ALERT_CHANNEL_ID)")
+    else:
+        miss = _missing_perms(ch)
+        lines.append("Channel alert: ✅ <#%s>%s" % (ch.id, "" if not miss else " · ❌ izin kurang: " + ", ".join(miss)))
+    if scan_state["at"]:
+        lines.append(f"Scan terakhir: <t:{int(scan_state['at'].timestamp())}:R> · lolos {scan_state['found']} "
+                     f"(SIGNAL {scan_state['signals']}, WATCH {scan_state['watch']}) · terkirim SIGNAL {scan_state['sent']}, WATCH {scan_state['watch_sent']}")
+    else:
+        lines.append("Scan terakhir: belum ada")
+    lines.append(f"Masalah terakhir: {scan_state['error'] or '— tidak ada'}")
+    return "\n".join(lines)
+
+
 @bot.tree.command(name="status", description="Cek status bot, konfigurasi dan market data")
 async def status(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     try:
         tickers = await market.get_tickers()
         await interaction.followup.send(
-            f"✅ Bot aktif · Pair linear terdeteksi: **{len(tickers)}**\n"
-            f"TF aktif: **{', '.join(SCAN_TIMEFRAMES)} menit** · Interval scan: **{SCAN_INTERVAL_SECONDS}s**\n"
-            f"Batas pair per scan: **{MAX_SCAN_SYMBOLS}** · Sinyal minimum: **{MIN_SIGNAL_SCORE}/100** · Watch minimum: **{MIN_WATCH_SCORE}/100**\n"
-            "Data: Bybit public API · Mode: sinyal saja, tanpa eksekusi order.", ephemeral=True)
+            f"✅ Bot aktif · Pair linear: **{len(tickers)}** · Metode: **Trend Pullback**\n"
+            f"TF: **{', '.join(SCAN_TIMEFRAMES)}m** · Scan tiap **{SCAN_INTERVAL_SECONDS}s** · Max pair **{MAX_SCAN_SYMBOLS}**\n"
+            f"Skor SIGNAL ≥ **{MIN_SIGNAL_SCORE}** · WATCH ≥ **{MIN_WATCH_SCORE}** · Fee diasumsikan **{FEE_PCT:g}%** pulang-pergi\n"
+            "Data: Bybit public API · Mode: sinyal + follow simulasi, tanpa eksekusi order.\n"
+            + await alert_diagnostics(), ephemeral=True)
     except Exception as e:
         await interaction.followup.send(f"Market data belum tersedia: {e}", ephemeral=True)
 
@@ -374,9 +653,11 @@ async def signal(interaction: discord.Interaction, pair: str, timeframe: app_com
     if not symbol.endswith("USDT"): symbol += "USDT"
     try:
         ticker = await market.get_ticker(symbol)
-        s = await analyze_symbol(market, symbol, timeframe.value, ticker=ticker)
+        diag = {}
+        s = await analyze_symbol(market, symbol, timeframe.value, ticker=ticker, diag=diag)
         if not s:
-            await interaction.followup.send(f"{symbol}: setup tidak memenuhi konfirmasi/likuiditas pada TF {timeframe.value}m. **NO TRADE**.")
+            why = "; ".join(diag.get("reasons", [])[:2]) or "tidak memenuhi syarat"
+            await interaction.followup.send(f"**{symbol}** TF {timeframe.value}m — **NO TRADE**\nAlasan: {why}")
         else:
             s["tier"] = classify(s)
             await interaction.followup.send(**await chart_kwargs(s, signal_embed(s)))
@@ -392,13 +673,12 @@ async def scanner(interaction: discord.Interaction, jumlah: app_commands.Range[i
     try:
         results = await scan_once()
         if not results:
-            await interaction.followup.send(f"Tidak ada setup dengan skor ≥ {MIN_WATCH_SCORE} yang lolos filter (tren 30m, spread, volatilitas). **NO TRADE**."); return
-        embed = discord.Embed(title="Bybit USDT Perpetual · Short-term Scanner", color=discord.Color.blurple(), timestamp=datetime.now(timezone.utc))
-        for s in results[:jumlah]:
-            embed.add_field(name=f'{"✅ SIGNAL" if s["tier"] == "SIGNAL" else "👀 WATCH"} · {s["symbol"]} · {s["direction"]} · {s["score"]}/100',
-                value=f'TF {s["timeframe"]}m | Entry {fmt_price(s["entry"])} | SL {fmt_price(s["sl"])} | TP {fmt_price(s["tp"])} | RR 1:{s["rr"]:.2f} | spread {s["spread_pct"]:.3f}%', inline=False)
-        embed.set_footer(text="Skor teknikal bukan probabilitas profit; level referensi, bukan jaminan fill." + (" Chart = setup teratas." if CHART_ENABLED else ""))
-        await interaction.followup.send(**await chart_kwargs(results[0], embed))
+            await interaction.followup.send(f"Tidak ada setup tren+pullback dengan skor ≥ {MIN_WATCH_SCORE}. **NO TRADE**."); return
+        top = results[:jumlah]
+        embed = discord.Embed(title="🔎 Scanner · Trend Pullback", description="\n".join(_line(s, True) for s in top),
+                              color=discord.Color.blurple(), timestamp=datetime.now(timezone.utc))
+        embed.set_footer(text="Level = referensi, bukan jaminan fill. Skor bukan probabilitas." + (" Chart = setup teratas." if CHART_ENABLED else ""))
+        await interaction.followup.send(**await chart_kwargs(top[0], embed))
     except Exception as e:
         log.exception("Scanner error"); await interaction.followup.send(f"Scanner gagal: {e}")
 
@@ -422,17 +702,39 @@ async def history(interaction: discord.Interaction):
     rows = await db.recent_signals(10)
     if not rows:
         await interaction.followup.send("Belum ada sinyal tersimpan.", ephemeral=True); return
-    lines = [f'`{r["symbol"]}` {r["direction"]} TF {r["timeframe"]}m · {r["score"]}/100 · Entry {fmt_price(r["entry"])} · SL {fmt_price(r["stop_loss"])} · TP {fmt_price(r["take_profit"])} · **{r.get("outcome") or "OPEN"}**' for r in rows]
+    lines = []
+    for r in rows:
+        o = r.get("outcome") or "OPEN"
+        res = f' · {r["net_r"]:+.2f}R' if r.get("net_r") is not None else ""
+        lines.append(f'{OUTCOME_ICON.get(o, "")} #{r["id"]} `{r["symbol"]}` {r["direction"][0]}·{r["timeframe"]}m · {r["score"]} · **{o}**{res}')
     await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+
+@bot.tree.command(name="riwayat", description="Riwayat trade yang kamu ikuti (Follow Trade)")
+@app_commands.describe(tampilkan="Filter tampilan")
+@app_commands.choices(tampilkan=[app_commands.Choice(name="Semua", value="all"),
+    app_commands.Choice(name="Berjalan", value="open"), app_commands.Choice(name="Selesai (TP/SL)", value="closed")])
+async def riwayat(interaction: discord.Interaction, tampilkan: Optional[app_commands.Choice[str]] = None):
+    await interaction.response.defer(ephemeral=True)
+    mode = tampilkan.value if tampilkan else "all"
+    await interaction.followup.send(embed=await build_history_embed(interaction.user, mode), ephemeral=True)
 
 
 @bot.tree.command(name="performance", description="Statistik hasil evaluasi sinyal")
 async def performance(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    total, tp, sl, ambiguous, expired, sum_r = await db.performance()
-    resolved = (tp or 0) + (sl or 0)
-    winrate = (tp or 0) / resolved * 100 if resolved else 0
-    await interaction.followup.send(f"**Statistik evaluator**\nTotal sinyal: **{total or 0}**\nTP: **{tp or 0}** · SL: **{sl or 0}** · Win rate TP/(TP+SL): **{winrate:.1f}%**\nAmbiguous (TP & SL candle sama): **{ambiguous or 0}** · Expired: **{expired or 0}**\nAkumulasi hasil: **{sum_r or 0:.2f}R** sebelum fee, funding, spread/slippage.\n\nIni evaluasi historis sederhana, bukan backtest tervalidasi atau prediksi profit.", ephemeral=True)
+    p = await db.performance()
+    decided = p["tp"] + p["sl"] + p["ambiguous"]
+    wr = p["tp"] / decided * 100 if decided else 0
+    tf_lines = "\n".join(f'• {tf}m: {b["n"]} trade · win {b["win"]} · net {b["net"]:+.2f}R' for tf, b in sorted(p["by_tf"].items()))
+    await interaction.followup.send(
+        f'**Statistik evaluator** (ambigu dihitung loss)\n'
+        f'Total **{p["total"]}** · Berjalan **{p["open"]}**\n'
+        f'✅ TP **{p["tp"]}** · ❌ SL **{p["sl"]}** · ⚠️ Ambigu **{p["ambiguous"]}** · ⌛ Expired **{p["expired"]}**\n'
+        f'Winrate konservatif TP/(TP+SL+Ambigu): **{wr:.1f}%**\n'
+        f'Hasil: gross **{p["gross_r"]:+.2f}R** · net **{p["net_r"]:+.2f}R** (fee ≈{FEE_PCT:g}%)\n'
+        + (tf_lines + "\n" if tf_lines else "") +
+        "\nEvaluasi sederhana (high/low candle), bukan backtest tervalidasi.", ephemeral=True)
 
 
 @bot.tree.command(name="evaluate", description="Jalankan evaluasi TP/SL sekarang")

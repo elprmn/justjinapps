@@ -1,100 +1,57 @@
-# Bybit USDT Perpetual Discord Signal Bot — Short-term build
+# Bybit USDT Perpetual Discord Signal Bot — v4 (Trend Pullback + Follow Trade)
 
-Discord slash-command bot for Bybit linear USDT perpetual public market data. It does **not** place orders and needs no Bybit API key. This is an experimental signal scanner, not a validated profitable strategy.
+Bot sinyal Discord untuk Bybit linear USDT perpetual (data publik, **tanpa API key, tanpa eksekusi order**).
+Ini scanner eksperimental, **bukan strategi yang terbukti profit**. Jalankan paper/follow dulu dan baca `/performance`.
 
-## Implemented
-- Strict entry timeframe options: **5m, 15m, 30m only**. No 1h signals.
-- Multi-timeframe logic: 30m trend filter, 15m momentum confirmation, selected timeframe entry trigger.
-- Indicators: EMA20/50/200, RSI, MACD, ATR, relative volume and 20-candle range breakout/breakdown.
-- Quality filters: 24h turnover, top-of-book bid/ask spread estimate, ATR volatility guard, closed candles only.
-- LONG/SHORT only when trend and momentum align; otherwise NO TRADE.
-- ATR/structure-based SL, TP reference and RR; rejects excessive stop distance.
-- Bounded concurrency, REST error/rate-limit handling, configurable scan interval and universe size.
-- Persistent Redis signal history, duplicate prevention across restarts, TP/SL outcome evaluator.
-- Same candle touches TP and SL => `AMBIGUOUS` rather than assuming a favorable result; unresolved signals expire.
-- `/status`, `/signal`, `/scanner`, `/market`, `/history`, `/performance`, `/evaluate`.
+## Metode: Trend Pullback (TF entry 5m/15m, filter 15m/30m)
+Syarat **wajib** untuk SIGNAL (LONG; SHORT kebalikannya):
+1. **Tren 30m:** close > EMA200, EMA20 > EMA50, close > EMA50, dan **ADX ≥ 20** (bukan sideways).
+2. **15m searah:** EMA20 > EMA50. TF entry: EMA20 > EMA50.
+3. **Pullback:** dalam 8 candle terakhir harga menyentuh EMA20 tanpa close di bawah EMA50; sentuhan terjadi di 2 candle terakhir.
+4. **Trigger:** candle close kembali di atas EMA20, searah, dengan **rejection wick (≥40% range) atau engulfing**, volume ≥ rata-rata, RSI naik dari area pullback.
+5. **Anti-chase:** close tidak boleh > 1,5×ATR dari EMA20.
+6. **Filter BTC:** untuk altcoin, arah yang melawan gerakan BTC 15m (> 1,5 ATR dalam 3 candle) diblok.
+7. **Fee:** setup ditolak jika fee pulang-pergi memakan > 0,25R (SL terlalu sempit). Akibatnya BTC/ETH di 5m sering tidak lolos; itu disengaja.
+8. **News:** isi `NEWS_BLACKOUTS` (UTC) agar tidak ada sinyal ±30 menit dari rilis besar.
 
-## Important limitations
-- Live ticker feed uses Bybit public WebSocket for up to 80 liquid USDT pairs, reconnects automatically, and falls back to REST for individual ticker requests when stream cache is stale. `/realtime` reports connection/cache health. Candle analysis still uses REST closed candles; the scheduled signal scanner is interval-based, not a tick-by-tick signal generator.
-- Funding rate is displayed when supplied by the ticker endpoint, but is not currently a hard signal filter. Open interest, liquidation feed and order-book depth are not implemented.
-- Evaluator uses candle high/low, not tick-by-tick execution. It does not model fees, funding paid, slippage, partial fills or exchange-specific order rules. `R` totals are gross estimates.
-- The score is a heuristic, **not a probability of winning**. No historical performance is established. Run paper trading and a proper out-of-sample backtest before relying on it.
-- No automatic trade execution; no private Bybit credentials should be added.
-- Redis data survives bot redeploys when the Redis service itself retains its data. Check the Redis provider persistence/backup and eviction settings; do not use an ephemeral Redis instance for important history.
+SL = di luar swing pullback + 0,2×ATR (min 0,8×ATR, maks 2,5×ATR). TP = `TP_R` × risiko (default **1R**).
+**WATCH** = tren valid dan pullback sedang berlangsung, belum ada candle konfirmasi (tidak masuk statistik, tidak bisa di-follow).
+Skor 0-100 hanya untuk **peringkat**, bukan probabilitas menang.
 
-## Discord setup
-1. Create an application at https://discord.com/developers/applications.
-2. Create a bot and copy its token privately. Never post the token publicly.
-3. Install with `bot` and `applications.commands` scopes. Grant View Channels, Send Messages, Embed Links.
-4. Copy server and alert-channel IDs (Developer Mode in Discord).
+Breakeven winrate (setelah fee): dengan TP 1R dan fee ≈0,13R, perlu winrate ≈ 56% hanya untuk impas. Verifikasi lewat `/performance` dan `/riwayat` sebelum percaya.
 
-## Deploy to PaaS
-1. Deploy this folder as a **background worker/service**, not a static site.
-2. Start command: `python bot.py` (Procfile included).
-3. Add environment variables from `.env.example`.
-4. Riwayat sinyal disimpan di Redis (`REDIS_URL`), bukan file lokal. Lihat bagian Railway di bawah.
-5. Start conservatively: `MAX_SCAN_SYMBOLS=15`, `SCAN_INTERVAL_SECONDS=120`, `SCAN_TIMEFRAMES=5,15,30`.
-6. Check logs for `Login sebagai ...`; run `/status`, `/market BTCUSDT`, `/signal BTCUSDT` selecting a timeframe, then `/scanner`.
+## Follow Trade
+- Tiap pesan **SIGNAL** punya tombol **✅ Ikut Trade** dan **📋 Riwayat Saya**.
+- Saat ikut, bot mencatat harga pasar saat itu sebagai harga masuk. Ditolak jika harga sudah menyentuh TP/SL atau sudah ≥ `FOLLOW_MAX_DRIFT_R` (0,5R) menuju TP.
+- Saat TP/SL tersentuh, bot menghitung hasil tiap follower dari harga masuk masing-masing (gross R dan net R setelah fee), mengubah footer pesan sinyal, menonaktifkan tombol, dan me-reply dengan mention para follower.
+- `/riwayat [Semua | Berjalan | Selesai]` menampilkan WR, total net R, dan 12 trade terbaru (hanya terlihat oleh kamu).
+- Tombol bersifat persisten: tetap berfungsi setelah bot restart/redeploy.
+- Ini **simulasi**, bukan order nyata.
 
-## Bybit public endpoints
-- `GET /v5/market/tickers?category=linear`
-- `GET /v5/market/kline?category=linear&symbol=BTCUSDT&interval=5&limit=250`
+## Perintah
+`/status` `/signal` `/scanner` `/market` `/history` `/riwayat` `/performance` `/evaluate` `/realtime`
+`/signal` yang ditolak menampilkan **alasan NO TRADE**.
 
-## Suggested next engineering phase
-1. Add WebSocket market streams with reconnect/backoff and stale-data guards.
-2. Add order-book depth, funding-rate thresholds and open-interest change filters.
-3. Build a reproducible historical backtest with fees/funding/slippage and walk-forward testing.
-4. Export signal history to CSV and add per-timeframe/per-symbol breakdowns.
-5. Only consider live order execution after a separate explicit design, security review and extensive paper trading.
+## Evaluator
+- Memakai high/low candle tertutup. TP dan SL di candle yang sama = `AMBIGUOUS`, **dihitung -1R** (konservatif).
+- R dilaporkan **gross dan net** (dikurangi `FEE_PCT`). Slippage/funding belum dimodelkan.
+- `/performance`: winrate konservatif = TP/(TP+SL+Ambigu), plus ringkasan per timeframe.
 
-## Deploy di Railway dengan Redis
+## Embed
+Embed SIGNAL kini 3 baris deskripsi (Entry/SL/TP · RR/skor/fee/spread · alasan), tanpa field, chart lebih pendek (900×410). WATCH satu baris per pair dan tanpa chart (aktifkan dengan `WATCH_CHART=1`).
 
-1. Upload/push seluruh isi folder ini ke repository GitHub, lalu buat service Railway dari repository tersebut.
-2. Tambahkan service **Redis** (atau Valkey yang kompatibel dengan Redis) pada project Railway.
-3. Buka service Redis dan pastikan tersedia variable koneksi seperti `REDIS_URL`.
-4. Pada service bot, buka **Variables** lalu tambahkan `REDIS_URL` menggunakan reference variable Railway, misalnya `${{Redis.REDIS_URL}}`. Jika nama service Redis berbeda, ganti `Redis` dengan nama service yang persis sama.
-5. Tambahkan `DISCORD_TOKEN`, `GUILD_ID`, dan `ALERT_CHANNEL_ID` pada service bot. Jangan commit file `.env` atau token ke GitHub.
-6. Pastikan Start Command `python bot.py` atau gunakan Procfile `worker: python bot.py`. Jalankan satu replica worker agar scanner tidak mengirim sinyal duplikat.
-7. Deploy dan lihat **Deploy Logs**. Bot akan melakukan ping ke Redis saat mulai; jika koneksi benar, log akan menampilkan `Redis signal store connected`.
-8. Di Discord coba `/status`, `/realtime`, `/market pair:BTCUSDT`, `/signal`, `/scanner`, `/history`, `/performance`, dan `/evaluate`.
+## Deploy (Railway + Redis)
+1. Push folder ini ke GitHub, buat service Railway dari repo. Tambahkan service **Redis/Valkey**.
+2. Variables pada service bot: `REDIS_URL=${{Redis.REDIS_URL}}`, `DISCORD_TOKEN`, `GUILD_ID`, `ALERT_CHANNEL_ID` (+ opsional lainnya dari `.env.example`).
+3. Start command `python bot.py` (Procfile: `worker: python bot.py`). **Satu replica** saja.
+4. Izin bot di channel alert: View Channel, Send Messages, Embed Links, **Attach Files**, **Read Message History** (untuk update pesan sinyal dan reply hasil). Scope invite: `bot` + `applications.commands`.
+5. Pastikan Redis punya persistensi dan eviction tidak menghapus key bot.
+6. Start konservatif: `MAX_SCAN_SYMBOLS=15`, `SCAN_INTERVAL_SECONDS=120`, `SCAN_TIMEFRAMES=5,15`.
 
-### Catatan Redis
-
-- Bot menyimpan riwayat sinyal sebagai record JSON di Redis, dengan indeks ID untuk daftar riwayat dan pencegahan duplikasi.
-- `REDIS_URL` wajib diisi untuk deployment ini. Jika kosong atau salah, bot akan berhenti dengan pesan error yang jelas.
-- Redis/Valkey berbeda dari PostgreSQL: bukan database SQL. Pastikan layanan Redis memiliki persistensi/backup yang sesuai dan kebijakan eviction tidak menghapus key bot. Jangan menghapus service Redis jika ingin mempertahankan riwayat.
-- Paket ini tidak mengimpor otomatis riwayat dari database PostgreSQL lama. Jika bot sebelumnya sudah menyimpan riwayat di PostgreSQL, data lama tetap di sana sampai dilakukan migrasi terpisah.
-
-### Catatan operasional
-
-- Bot hanya menggunakan **Bybit public market data**; tidak perlu API key Bybit dan tidak mengeksekusi order.
-- Feed ticker WebSocket adalah real-time; candle analisis diambil melalui REST dan candle yang masih terbentuk dikecualikan.
-- Jika koneksi WebSocket terputus, bot mencoba menyambung kembali dan REST tetap tersedia sebagai fallback.
-- Gunakan satu instance bot untuk menghindari scanner berjalan ganda. Slash commands mungkin memerlukan waktu untuk muncul jika tidak mengisi `GUILD_ID`.
-- Sinyal, skor, TP/SL, dan statistik bersifat informasional/edukasi, bukan jaminan profit atau nasihat keuangan.
-
-### Troubleshooting
-
-**Slash command (/scanner dll.) tidak muncul**
-- Log harus menampilkan `Slash command tersinkron ...: status, signal, scanner, ...`. Jika tidak ada, lihat error di baris sebelumnya.
-- `Missing Access` / `Forbidden`: bot belum di-invite dengan scope **`applications.commands`** (selain `bot`) atau tidak ada di server `GUILD_ID`. Invite ulang lewat Developer Portal → OAuth2 → URL Generator.
-- `GUILD_ID` harus angka ID server (tanpa tanda kutip). Jika kosong/salah, command didaftarkan global dan bisa lambat muncul.
-- Setelah deploy, restart Discord (Ctrl+R / tutup-buka app) agar daftar command ter-refresh.
-
-**`403 Forbidden` dari api.bybit.com**
-- Bybit memblokir IP/region tertentu (termasuk banyak IP datacenter AS). Pindahkan service ke region **Singapore (Southeast Asia)** di Railway → Service → Settings → Deploy → Region, lalu redeploy.
-- Bot otomatis mencoba host cadangan `api.bytick.com`. Host bisa diganti dengan `BYBIT_REST_URLS` (pisah koma) dan `BYBIT_WS_URL` (opsional).
-- Saat diblok, bot memakai backoff (5s → maks 300s) sehingga tidak membanjiri API.
-
-### Tingkat notifikasi: SIGNAL vs WATCH
-- **SIGNAL**: tren 30m dan momentum 15m searah, skor >= `MIN_SIGNAL_SCORE`. Disimpan ke Redis, dievaluasi TP/SL, masuk `/performance`.
-- **WATCH**: tren 30m searah dengan skor >= `MIN_WATCH_SCORE` tetapi belum SIGNAL penuh (mis. belum breakout / 15m belum searah). Hanya notifikasi, **tidak** masuk statistik. Satu embed per scan, cooldown per pair+arah `WATCH_COOLDOWN_MINUTES`.
-- Skor maksimum yang bisa dicapai adalah 80. `MIN_SIGNAL_SCORE=75` praktis hanya lolos jika ada breakout 20 candle + volume + RSI ideal sekaligus, sehingga sangat jarang. Untuk SIGNAL tanpa breakout, nilai sekitar 65 lebih realistis (cek hasilnya di `/performance` sebelum dipercaya).
-- Log tiap scan menampilkan jumlah kandidat, skor tertinggi, dan jumlah SIGNAL/WATCH untuk membantu tuning.
-- Isi `ALERT_CHANNEL_ID` (wajib untuk notifikasi otomatis) dan opsional `ALERT_ROLE_ID` untuk ping role.
-
-### Chart di embed
-- Setiap notifikasi SIGNAL, `/signal`, dan `/scanner` (setup teratas) melampirkan gambar candlestick dengan garis **Entry**, **SL**, **TP**, zona risk/reward, EMA20/EMA50, dan volume.
-- WATCH menampilkan chart untuk pair dengan skor tertinggi pada pesan tersebut.
-- Env: `CHART_ENABLED` (1/0), `CHART_CANDLES` (jumlah candle, 30-200), `CHART_TZ` (zona waktu label, default `Asia/Jakarta`).
-- Chart dirender di thread terpisah (~0,3 detik). Jika render gagal, embed teks tetap terkirim. Bot perlu izin **Attach Files** di channel alert.
+## Troubleshooting
+- **Sinyal tidak terkirim otomatis tapi `/scanner` jalan:** jalankan `/status`, bagian *Alert otomatis* menunjukkan penyebabnya (Redis belum terhubung, `ALERT_CHANNEL_ID` salah, atau izin channel kurang). `/scanner` tidak butuh Redis/channel, alert otomatis butuh keduanya. Hanya setup **SIGNAL** (konfirmasi sudah close) yang dikirim sebagai sinyal; sisanya muncul sebagai WATCH.
+- **Slash command tidak muncul:** cek log `Slash command tersinkron ...`; invite ulang dengan scope `applications.commands`; `GUILD_ID` harus angka.
+- **403 dari api.bybit.com:** pindahkan region Railway ke Singapore; bot mencoba host cadangan `api.bytick.com` (`BYBIT_REST_URLS`).
+- **Tombol "interaction failed" setelah update:** pastikan memakai discord.py ≥ 2.4 (dynamic items).
+- **Sinyal terlalu jarang:** longgarkan bertahap `ADX_MIN`, `MAX_FEE_R`, `MAX_SPREAD_PCT`, atau tambah `MAX_SCAN_SYMBOLS`. Jangan menurunkan syarat pullback/trigger tanpa data `/performance`.
+- Data lama dari versi sebelumnya tetap terbaca; field baru (`net_r`, `fee_r`) kosong untuk sinyal lama.

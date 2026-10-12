@@ -3,6 +3,7 @@ import os
 import time
 import json
 import logging
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import aiohttp
@@ -29,10 +30,60 @@ class BybitBlockedError(RuntimeError):
 INTERVALS = {"5": "5", "15": "15", "30": "30"}
 
 
+def _env_float(name, default):
+    try:
+        return float(os.getenv(name, str(default)).strip())
+    except (TypeError, ValueError):
+        return float(default)
+
+
+# ---------------- Konfigurasi metode Trend Pullback ----------------
+TP_R = max(0.5, _env_float("TP_R", 1.0))                  # TP = TP_R x jarak SL (1.0 = target winrate tinggi)
+ADX_MIN = _env_float("ADX_MIN", 20)                       # ADX 30m minimal (filter sideways)
+PULLBACK_LOOKBACK = int(_env_float("PULLBACK_LOOKBACK", 8))  # candle terakhir yang dicek untuk pullback
+MAX_EXTENDED_ATR = _env_float("MAX_EXTENDED_ATR", 1.5)    # anti-chase: maks jarak close dari EMA20 (x ATR)
+SL_BUFFER_ATR = 0.2                                       # buffer SL di luar swing pullback
+SL_ATR_MIN, SL_ATR_MAX = 0.8, 2.5                         # batas jarak SL (x ATR)
+FEE_PCT = _env_float("FEE_PCT", 0.11)                     # fee pulang-pergi (%), taker 0.055% x 2
+MAX_FEE_R = _env_float("MAX_FEE_R", 0.25)                 # tolak setup jika fee > X R (SL terlalu sempit)
+MAX_SPREAD_PCT = _env_float("MAX_SPREAD_PCT", 0.10)
+BTC_FILTER = os.getenv("BTC_FILTER", "1").strip().lower() not in ("0", "false", "no", "off")
+BTC_DUMP_ATR = _env_float("BTC_DUMP_ATR", 1.5)            # BTC 15m gerak > X ATR dalam 3 candle => blok arah berlawanan
+NEWS_WINDOW_MIN = int(_env_float("NEWS_WINDOW_MIN", 30))
+
+
+def _parse_blackouts(raw):
+    out = []
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            dt = datetime.fromisoformat(part.replace("Z", "+00:00"))
+            out.append(dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc))
+        except ValueError:
+            log.warning("NEWS_BLACKOUTS: format salah diabaikan: %r (pakai ISO UTC, mis. 2026-10-14T12:30)", part)
+    return out
+
+
+# Jadwal news besar (UTC, ISO, pisah koma) diisi manual lewat env, mis. FOMC/CPI/NFP.
+NEWS_BLACKOUTS = _parse_blackouts(os.getenv("NEWS_BLACKOUTS", ""))
+
+
+def in_news_blackout(now=None):
+    now = now or datetime.now(timezone.utc)
+    w = timedelta(minutes=NEWS_WINDOW_MIN)
+    return any(abs(now - t) <= w for t in NEWS_BLACKOUTS)
+
+
+
 def fmt_price(value):
+    """Harga ringkas: presisi menyesuaikan besar harga (hemat lebar embed)."""
     try:
         x = float(value)
-        return f"{x:,.8f}".rstrip("0").rstrip(".")
+        dec = 2 if abs(x) >= 1000 else 3 if abs(x) >= 100 else 4 if abs(x) >= 1 else 6 if abs(x) >= 0.01 else 8
+        out = f"{x:,.{dec}f}"
+        return out.rstrip("0").rstrip(".") if "." in out else out
     except (TypeError, ValueError):
         return str(value)
 
@@ -47,6 +98,10 @@ class BybitMarket:
         self.ws_last_message = None
         self.ws_task = None
         self.host_idx = 0
+        self._kline_cache = {}
+        self._kline_locks = {}
+        self._btc = None
+        self._btc_lock = asyncio.Lock()
 
     async def start(self):
         timeout = aiohttp.ClientTimeout(total=15, connect=8)
@@ -205,6 +260,40 @@ class BybitMarket:
             df = df.iloc[:-1].reset_index(drop=True)
         return df
 
+    async def get_klines_cached(self, symbol, interval, ttl=25):
+        """Kline 250 candle dengan cache singkat; mengurangi request REST (15m/30m dipakai ulang antar TF)."""
+        key = (symbol, interval)
+        hit = self._kline_cache.get(key)
+        if hit and time.time() - hit[0] <= ttl:
+            return hit[1]
+        lock = self._kline_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            hit = self._kline_cache.get(key)
+            if hit and time.time() - hit[0] <= ttl:
+                return hit[1]
+            df = await self.get_klines(symbol, interval, 250)
+            self._kline_cache[key] = (time.time(), df)
+            if len(self._kline_cache) > 400:
+                for k, _ in sorted(self._kline_cache.items(), key=lambda kv: kv[1][0])[:100]:
+                    self._kline_cache.pop(k, None)
+                    self._kline_locks.pop(k, None)
+            return df
+
+    async def btc_move_atr(self):
+        """Gerak BTC 15m selama 3 candle terakhir dalam satuan ATR (negatif = turun). Dipakai sebagai filter pasar."""
+        now = time.time()
+        if self._btc and now - self._btc[0] <= 25:
+            return self._btc[1]
+        async with self._btc_lock:
+            if self._btc and time.time() - self._btc[0] <= 25:
+                return self._btc[1]
+            df = add_indicators(await self.get_klines_cached("BTCUSDT", "15"))
+            atr = float(df["atr"].iloc[-1])
+            move = float(df["close"].iloc[-1] - df["close"].iloc[-4])
+            val = move / atr if atr > 0 else 0.0
+            self._btc = (time.time(), val)
+            return val
+
 
 def add_indicators(df):
     df = df.copy()
@@ -217,120 +306,209 @@ def add_indicators(df):
     loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
     rs = gain / loss.replace(0, np.nan)
     df["rsi"] = 100 - (100 / (1 + rs))
-    ema12 = close.ewm(span=12, adjust=False).mean()
-    ema26 = close.ewm(span=26, adjust=False).mean()
-    df["macd"] = ema12 - ema26
-    df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
     prev_close = close.shift(1)
     tr = pd.concat([
         df["high"] - df["low"], (df["high"] - prev_close).abs(),
         (df["low"] - prev_close).abs()
     ], axis=1).max(axis=1)
-    df["atr"] = tr.ewm(alpha=1/14, adjust=False).mean()
+    atr = tr.ewm(alpha=1/14, adjust=False).mean()
+    df["atr"] = atr
+    # ADX (Wilder) untuk filter sideways
+    up, down = df["high"].diff(), -df["low"].diff()
+    plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=df.index)
+    minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=df.index)
+    plus_di = 100 * plus_dm.ewm(alpha=1/14, adjust=False).mean() / atr.replace(0, np.nan)
+    minus_di = 100 * minus_dm.ewm(alpha=1/14, adjust=False).mean() / atr.replace(0, np.nan)
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    df["adx"] = dx.ewm(alpha=1/14, adjust=False).mean()
     df["vol_sma20"] = df["volume"].rolling(20).mean()
-    df["high20"] = df["high"].shift(1).rolling(20).max()
-    df["low20"] = df["low"].shift(1).rolling(20).min()
     return df
 
 
-async def analyze_symbol(client: BybitMarket, symbol: str, entry_tf: str = "5", ticker=None) -> Optional[dict]:
+def _setup(direction, df, m15, m30, price, atr, btc_move, is_btc, diag):
+    """Metode Trend Pullback (satu arah). Kembalikan dict setup atau None.
+
+    stage "TRIGGER"  = pullback ke EMA20 + candle konfirmasi (rejection/engulfing) sudah close -> SIGNAL
+    stage "PULLBACK" = tren valid, harga sedang pullback ke EMA20, belum ada konfirmasi -> WATCH
+    """
+    long = direction == "LONG"
+    sgn = 1 if long else -1
+
+    def rej(reason):
+        if diag is not None:
+            diag.setdefault("reasons", []).append(f"{direction}: {reason}")
+        return None
+
+    # 1) Tren 30m (wajib): EMA200 + EMA20/50 searah, dan bukan sideways (ADX)
+    if long:
+        trend30 = m30["close"] > m30["ema200"] and m30["ema20"] > m30["ema50"] and m30["close"] > m30["ema50"]
+    else:
+        trend30 = m30["close"] < m30["ema200"] and m30["ema20"] < m30["ema50"] and m30["close"] < m30["ema50"]
+    if not trend30:
+        return rej("tren 30m tidak searah (EMA200/EMA20/EMA50)")
+    adx30 = float(m30["adx"]) if pd.notna(m30["adx"]) else 0.0
+    if adx30 < ADX_MIN:
+        return rej(f"ADX 30m {adx30:.0f} < {ADX_MIN:.0f} (sideways)")
+    # 2) Konfirmasi 15m (wajib)
+    if not ((m15["ema20"] > m15["ema50"]) if long else (m15["ema20"] < m15["ema50"])):
+        return rej("EMA20/50 15m belum searah")
+    # 3) Struktur TF entry
+    e, p = df.iloc[-1], df.iloc[-2]
+    seg = df.iloc[-PULLBACK_LOOKBACK:]
+    entry_aligned = (e["ema20"] > e["ema50"]) if long else (e["ema20"] < e["ema50"])
+    if not entry_aligned:
+        return rej("EMA20/50 TF entry tidak searah")
+    held = bool((seg["close"] >= seg["ema50"]).all()) if long else bool((seg["close"] <= seg["ema50"]).all())
+    if not held:
+        return rej("pullback menembus EMA50 (struktur rusak)")
+    touched = bool((seg["low"] <= seg["ema20"]).any()) if long else bool((seg["high"] >= seg["ema20"]).any())
+    if not touched:
+        return rej("belum ada pullback ke EMA20")
+    # 4) Anti-chase
+    ext = (e["close"] - e["ema20"]) / atr * sgn
+    if ext > MAX_EXTENDED_ATR:
+        return rej(f"harga sudah lari {ext:.1f}x ATR dari EMA20 (anti-chase)")
+    # 5) Filter BTC (bukan untuk BTC sendiri)
+    btc_aligned = True
+    if not is_btc and btc_move is not None:
+        if (long and btc_move <= -BTC_DUMP_ATR) or (not long and btc_move >= BTC_DUMP_ATR):
+            return rej(f"BTC 15m bergerak melawan ({btc_move:+.1f} ATR)")
+        btc_aligned = (btc_move >= 0) if long else (btc_move <= 0)
+
+    # 6) Trigger candle
+    rng = float(e["high"] - e["low"])
+    touch_recent = bool((df["low"].iloc[-2:] <= df["ema20"].iloc[-2:]).any()) if long else \
+        bool((df["high"].iloc[-2:] >= df["ema20"].iloc[-2:]).any())
+    back = e["close"] > e["ema20"] if long else e["close"] < e["ema20"]
+    right_color = e["close"] > e["open"] if long else e["close"] < e["open"]
+    if long:
+        wick = float(min(e["open"], e["close"]) - e["low"])
+        engulf = bool(p["close"] < p["open"] and e["close"] > p["open"] and e["open"] <= p["close"])
+    else:
+        wick = float(e["high"] - max(e["open"], e["close"]))
+        engulf = bool(p["close"] > p["open"] and e["close"] < p["open"] and e["open"] >= p["close"])
+    rejection = rng > 0 and wick / rng >= 0.4
+    vol_x = float(e["volume"] / e["vol_sma20"]) if pd.notna(e["vol_sma20"]) and e["vol_sma20"] > 0 else 0.0
+    rsi, rsi_prev = float(e["rsi"]), float(p["rsi"])
+    if long:
+        rsi_ok = 45 <= rsi <= 68 and rsi > rsi_prev and float(seg["rsi"].min()) <= 55
+    else:
+        rsi_ok = 32 <= rsi <= 55 and rsi < rsi_prev and float(seg["rsi"].max()) >= 45
+    trigger = bool(touch_recent and back and right_color and (rejection or engulf) and vol_x >= 1.0 and rsi_ok)
+
+    if not trigger:
+        # WATCH hanya jika pullback masih aktif (sentuh EMA20 dalam 3 candle terakhir)
+        active = bool((df["low"].iloc[-3:] <= df["ema20"].iloc[-3:]).any()) if long else \
+            bool((df["high"].iloc[-3:] >= df["ema20"].iloc[-3:]).any())
+        if not active:
+            return rej("pullback sudah lewat tanpa konfirmasi")
+    stage = "TRIGGER" if trigger else "PULLBACK"
+
+    # 7) SL di luar swing pullback + buffer; TP = TP_R x risiko
+    if long:
+        sl = float(seg["low"].min()) - SL_BUFFER_ATR * atr
+        if price - sl < SL_ATR_MIN * atr:
+            sl = price - SL_ATR_MIN * atr
+        risk = price - sl
+    else:
+        sl = float(seg["high"].max()) + SL_BUFFER_ATR * atr
+        if sl - price < SL_ATR_MIN * atr:
+            sl = price + SL_ATR_MIN * atr
+        risk = sl - price
+    if risk <= 0 or risk > SL_ATR_MAX * atr:
+        return rej(f"pullback terlalu dalam (SL {risk / atr:.1f}x ATR)")
+    tp = price + sgn * TP_R * risk
+    risk_pct = risk / price * 100
+    fee_r = FEE_PCT / risk_pct
+    if fee_r > MAX_FEE_R:
+        return rej(f"fee memakan {fee_r:.2f}R (SL {risk_pct:.2f}% terlalu sempit untuk scalping)")
+
+    # Skor 0-100 (urutan prioritas, bukan probabilitas menang)
+    score = 20                                                   # tren 30m valid
+    score += 5 + min(5, max(0.0, adx30 - ADX_MIN) / 2)           # kekuatan tren (ADX)
+    score += 10                                                  # 15m searah
+    score += 5                                                   # EMA TF entry searah
+    score += 10                                                  # pullback tertahan di atas/bawah EMA50
+    score += 5 if touch_recent else 0                            # sentuhan EMA20 baru saja
+    score += (8 if rejection else 0) + (7 if engulf else 0)      # candle konfirmasi
+    score += 10 if vol_x >= 1.5 else 5 if vol_x >= 1.0 else 0    # volume
+    score += 10 if rsi_ok else 0                                 # RSI naik/turun dari area pullback
+    score += 5 if btc_aligned else 0                             # BTC searah / netral
+    score = int(round(min(100, score)))
+
+    reasons = [f"Tren 30m {'↑' if long else '↓'} · ADX {adx30:.0f}", "Pullback EMA20"]
+    if trigger:
+        kinds = [k for k, ok in (("rejection", rejection), ("engulfing", engulf)) if ok]
+        reasons.append(" + ".join(kinds))
+        reasons.append(f"Vol {vol_x:.1f}x")
+        reasons.append(f"RSI {rsi:.0f}{'↑' if long else '↓'}")
+    else:
+        reasons.append("menunggu candle konfirmasi")
+    return {"direction": direction, "stage": stage, "score": score, "sl": float(sl), "tp": float(tp),
+            "rr": TP_R, "risk_pct": risk_pct, "reward_pct": risk_pct * TP_R, "fee_r": fee_r,
+            "adx": adx30, "vol_x": vol_x, "rsi": rsi, "reasons": reasons,
+            "btc_aligned": btc_aligned, "confirm15": True}
+
+
+async def analyze_symbol(client: BybitMarket, symbol: str, entry_tf: str = "5", ticker=None, diag=None) -> Optional[dict]:
+    """Analisis Trend Pullback. `diag` (dict, opsional) diisi alasan penolakan untuk ditampilkan ke user."""
     if entry_tf not in INTERVALS:
         raise ValueError("Timeframe hanya 5, 15, atau 30 menit.")
-    # Use only requested short-term TFs. The selected entry TF must be one of these.
+
+    def reject(reason):
+        if diag is not None:
+            diag.setdefault("reasons", []).insert(0, reason)
+        return None
+
+    if in_news_blackout():
+        return reject(f"jendela news besar (±{NEWS_WINDOW_MIN} menit)")
     tfs = list(dict.fromkeys([entry_tf, "15", "30"]))
-    data = await asyncio.gather(*(client.get_klines(symbol, tf, 250) for tf in tfs))
+    data = await asyncio.gather(*(client.get_klines_cached(symbol, tf) for tf in tfs))
     frames = {tf: add_indicators(df) for tf, df in zip(tfs, data)}
     if any(len(df) < 205 for df in frames.values()):
-        return None
-
-    def last(tf):
-        return frames[tf].iloc[-1]
-
-    e, m15, m30 = last(entry_tf), last("15"), last("30")
-    price = float(e["close"])
-    atr = float(e["atr"]) if pd.notna(e["atr"]) else 0
+        return reject("data candle belum cukup (butuh 205+ candle)")
+    df = frames[entry_tf]
+    m15, m30 = frames["15"].iloc[-1], frames["30"].iloc[-1]
+    price = float(df["close"].iloc[-1])
+    atr = float(df["atr"].iloc[-1]) if pd.notna(df["atr"].iloc[-1]) else 0.0
     if not atr or price <= 0:
-        return None
+        return reject("ATR tidak valid")
 
-    # Market quality filters: ticker spread, minimum turnover, and ATR sanity.
     ticker = ticker or await client.get_ticker(symbol)
     bid, ask = float(ticker.get("bid1Price", 0) or 0), float(ticker.get("ask1Price", 0) or 0)
     spread_pct = ((ask - bid) / ((ask + bid) / 2) * 100) if bid > 0 and ask >= bid else 999.0
     turnover = float(ticker.get("turnover24h", 0) or 0)
-    if spread_pct > 0.15 or turnover < 1_000_000:
-        return None
+    if spread_pct > MAX_SPREAD_PCT or turnover < 1_000_000:
+        return reject(f"likuiditas kurang (spread {spread_pct:.3f}%, turnover {turnover:,.0f})")
     atr_pct = atr / price * 100
-    if atr_pct < 0.03 or atr_pct > 3.0:
+    if atr_pct < 0.05 or atr_pct > 3.0:
+        return reject(f"volatilitas di luar batas (ATR {atr_pct:.2f}%)")
+
+    is_btc = symbol == "BTCUSDT"
+    btc_move = None
+    if BTC_FILTER and not is_btc:
+        try:
+            btc_move = await client.btc_move_atr()
+        except Exception as exc:
+            log.warning("Filter BTC dilewati (data BTC gagal): %s", exc)
+
+    cands = [c for c in (_setup(d, df, m15, m30, price, atr, btc_move, is_btc, diag) for d in ("LONG", "SHORT")) if c]
+    if not cands:
+        if diag is not None and diag.get("reasons"):
+            rs = diag["reasons"]
+            useful = [r for r in rs if "tren 30m tidak searah" not in r]  # alasan arah yang paling dekat valid lebih informatif
+            diag["reasons"] = (useful or rs)[:2]
         return None
-
-    long_score, short_score = 0, 0
-    long_reasons, short_reasons = [], []
-
-    def award(condition, points, side, reason):
-        nonlocal long_score, short_score
-        if bool(condition):
-            if side == "LONG":
-                long_score += points
-                long_reasons.append(reason)
-            else:
-                short_score += points
-                short_reasons.append(reason)
-
-    # Entry trigger: momentum plus a close beyond a recent 20-candle range.
-    award(e["ema20"] > e["ema50"] and price > e["ema20"], 12, "LONG", "Harga di atas EMA20/EMA50")
-    award(e["ema20"] < e["ema50"] and price < e["ema20"], 12, "SHORT", "Harga di bawah EMA20/EMA50")
-    award(52 <= e["rsi"] <= 70, 8, "LONG", "RSI mendukung momentum bullish")
-    award(30 <= e["rsi"] <= 48, 8, "SHORT", "RSI mendukung momentum bearish")
-    award(e["macd"] > e["macd_signal"], 8, "LONG", "MACD bullish")
-    award(e["macd"] < e["macd_signal"], 8, "SHORT", "MACD bearish")
-    award(pd.notna(e["vol_sma20"]) and e["volume"] > e["vol_sma20"] * 1.15, 8, "LONG", "Volume naik di atas rata-rata")
-    award(pd.notna(e["vol_sma20"]) and e["volume"] > e["vol_sma20"] * 1.15, 8, "SHORT", "Volume naik di atas rata-rata")
-    award(pd.notna(e["high20"]) and price > e["high20"], 15, "LONG", "Breakout high 20 candle")
-    award(pd.notna(e["low20"]) and price < e["low20"], 15, "SHORT", "Breakdown low 20 candle")
-
-    # 30m is the trend filter; 15m confirms momentum. Contradiction => NO TRADE.
-    bull30 = m30["ema20"] > m30["ema50"] and m30["close"] > m30["ema50"]
-    bear30 = m30["ema20"] < m30["ema50"] and m30["close"] < m30["ema50"]
-    bull15 = m15["ema20"] > m15["ema50"] and m15["macd"] > m15["macd_signal"]
-    bear15 = m15["ema20"] < m15["ema50"] and m15["macd"] < m15["macd_signal"]
-    award(bull15, 12, "LONG", "Konfirmasi momentum 15m bullish")
-    award(bear15, 12, "SHORT", "Konfirmasi momentum 15m bearish")
-    award(bull30, 17, "LONG", "Tren utama 30m bullish")
-    award(bear30, 17, "SHORT", "Tren utama 30m bearish")
-
-    # Tren 30m wajib searah. Konfirmasi 15m tidak lagi wajib di sini, tapi dicatat di
-    # `confirm15`: bot.py memakainya untuk membedakan SIGNAL (terkonfirmasi) dan WATCH (indikasi awal).
-    if bull30 and long_score >= short_score + 15:
-        direction, score, reasons, confirm15 = "LONG", min(100, long_score), long_reasons, bool(bull15)
-    elif bear30 and short_score >= long_score + 15:
-        direction, score, reasons, confirm15 = "SHORT", min(100, short_score), short_reasons, bool(bear15)
-    else:
-        return None
-
-    # SL uses ATR and recent structure; ensure nonzero risk and RR >= 1.5.
-    if direction == "LONG":
-        structural_sl = float(e["low20"]) if pd.notna(e["low20"]) else price - 1.5 * atr
-        sl = min(price - 1.2 * atr, structural_sl - 0.1 * atr)
-        risk = price - sl
-        tp = price + 1.8 * risk
-    else:
-        structural_sl = float(e["high20"]) if pd.notna(e["high20"]) else price + 1.5 * atr
-        sl = max(price + 1.2 * atr, structural_sl + 0.1 * atr)
-        risk = sl - price
-        tp = price - 1.8 * risk
-    if risk <= 0 or abs(price - sl) / price > 0.04:
-        return None
+    best = max(cands, key=lambda c: (c["stage"] == "TRIGGER", c["score"]))
 
     funding = ticker.get("fundingRate")
     try:
         funding_pct = float(funding) * 100 if funding not in (None, "") else None
     except (TypeError, ValueError):
         funding_pct = None
-    return {
-        "symbol": symbol, "timeframe": entry_tf, "direction": direction,
-        "score": int(score), "entry": price, "sl": float(sl), "tp": float(tp),
-        "rr": 1.8, "reasons": reasons, "candle_start": int(e["start"]),
-        "spread_pct": spread_pct, "turnover24h": turnover, "atr_pct": atr_pct,
-        "funding_pct": funding_pct, "confirm15": confirm15,
-        "chart_df": frames[entry_tf].tail(150).copy(),  # dipakai chart.py; tidak disimpan ke Redis
-    }
+    best.update({
+        "symbol": symbol, "timeframe": entry_tf, "entry": price, "candle_start": int(df["start"].iloc[-1]),
+        "spread_pct": spread_pct, "turnover24h": turnover, "atr_pct": atr_pct, "funding_pct": funding_pct,
+        "chart_df": df.tail(150).copy(),  # dipakai chart.py; tidak disimpan ke Redis
+    })
+    return best
