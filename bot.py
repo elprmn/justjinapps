@@ -391,60 +391,97 @@ async def live_follow_metrics(rec):
 
 
 async def build_live_trades_embed(user):
-    """Compact mobile-friendly private embed for followed OPEN paper trades."""
+    """Premium dashboard-style snapshot for followed OPEN paper trades."""
     recs = await db.user_follows(user.id, 200)
     open_recs = [r for r in recs if r.get("status") == "OPEN"][:20]
     if not open_recs:
         embed = discord.Embed(
-            title="📊 Trade Aktif",
-            description="Belum ada trade berjalan. Tekan **Ikut Trade** pada sinyal aktif untuk mulai mengikuti.",
-            color=discord.Color.blurple(),
+            title="TRADE DASHBOARD",
+            description=(
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "**Tidak ada posisi aktif**\n"
+                "Mulai dengan menekan **Ikut Trade** pada sinyal yang ingin kamu pantau."
+            ),
+            color=discord.Color.from_rgb(35, 42, 55),
+            timestamp=datetime.now(timezone.utc),
         )
-        embed.set_footer(text="Paper trading · Snapshot Bybit saat /trade dipanggil · Bukan order nyata")
+        embed.set_author(name="PREMIUM TRADING · PORTFOLIO")
+        embed.add_field(name="STATUS", value="`● STANDBY`", inline=True)
+        embed.add_field(name="OPEN POSITIONS", value="`00`", inline=True)
+        embed.add_field(name="MODE", value="`PAPER`", inline=True)
+        embed.set_footer(text="BYBIT MARKET SNAPSHOT  •  Paper trading only — no real orders")
         return embed
 
     net_values = []
+    gross_values = []
     fields = []
     for rec in open_recs:
         live = await live_follow_metrics(rec)
-        side = "L" if rec.get("direction") == "LONG" else "S"
-        side_label = "LONG" if side == "L" else "SHORT"
+        side = "LONG" if rec.get("direction") == "LONG" else "SHORT"
         age_ts = _ts(rec.get("followed_at"))
-        age = f'<t:{age_ts}:R>' if age_ts else "waktu tidak tersedia"
+        age = f'<t:{age_ts}:R>' if age_ts else "n/a"
         entry = float(rec.get("follow_price") or 0)
         sl = float(rec.get("sl") or 0)
         tp = float(rec.get("tp") or 0)
-        title = f'{"🟢" if side == "L" else "🔴"} {rec["symbol"]} · {side_label} · {rec["timeframe"]}m  |  OPEN'
+        side_icon = "🟢" if side == "LONG" else "🔴"
         if live:
             pnl = live["move_pct"]
             net = live["net_pct"]
+            gross_values.append(pnl)
             net_values.append(net)
-            sign_icon = "🟢" if net >= 0 else "🔴"
+            net_icon = "🟩" if net >= 0 else "🟥"
+            # Keep each position as its own full-width card-like embed field for mobile.
+            # Avoid custom emoji dependencies; compact metadata line works on every server.
             value = (
-                f'**PnL {pnl:+.2f}%**  ·  **Net {net:+.2f}%**\n'
-                f'ROI (1x) **{pnl:+.2f}%**\n'
-                f'`Entry {fmt_price(entry)}` → `{fmt_price(live["price"])}`\n'
-                f'`SL {fmt_price(sl)}`  ·  `TP {fmt_price(tp)}`\n'
-                f'{sign_icon} Diikuti {age}'
+                f"{net_icon} **NET PNL**  `{net:+.2f}%`  ·  **GROSS**  `{pnl:+.2f}%`\n"
+                f"`ENTRY` **{fmt_price(entry)}**  →  `LAST` **{fmt_price(live['price'])}**\n"
+                f"🛡️ `SL` {fmt_price(sl)}  ·  🎯 `TP` {fmt_price(tp)}\n"
+                f"<t:{age_ts}:R>" if age_ts else
+                f"{net_icon} **NET PNL**  `{net:+.2f}%`  ·  **GROSS**  `{pnl:+.2f}%`\n"
+                f"`ENTRY` **{fmt_price(entry)}**  →  `LAST` **{fmt_price(live['price'])}**\n"
+                f"🛡️ `SL` {fmt_price(sl)}  ·  🎯 `TP` {fmt_price(tp)}\nDiikuti: waktu tidak tersedia"
             )
         else:
             value = (
-                f'⚪ **PnL / ROI: data harga belum tersedia**\n'
-                f'`Entry {fmt_price(entry)}`  ·  `SL {fmt_price(sl)}`  ·  `TP {fmt_price(tp)}`\n'
-                f'⏱ Diikuti {age}'
+                "⚪ **DATA HARGA BELUM TERSEDIA**\n"
+                f"`ENTRY` **{fmt_price(entry)}**\n"
+                f"🛡️ `SL` {fmt_price(sl)}  ·  🎯 `TP` {fmt_price(tp)}\n"
+                f"Diikuti: {age}"
             )
-        fields.append((title, value[:1024]))
+        fields.append((
+            f"{side_icon}  {rec['symbol']}  /  {side}  ·  {rec['timeframe']}M  ·  OPEN",
+            value[:1024],
+        ))
 
-    color = (discord.Color.green() if sum(net_values) >= 0 else discord.Color.red()) if net_values else discord.Color.blurple()
+    total_net = sum(net_values) if net_values else 0.0
+    total_gross = sum(gross_values) if gross_values else 0.0
+    avg_net = total_net / len(net_values) if net_values else 0.0
+    color = (discord.Color.from_rgb(28, 185, 105) if total_net >= 0
+             else discord.Color.from_rgb(230, 72, 82)) if net_values else discord.Color.from_rgb(67, 80, 102)
+    net_label = f"`{total_net:+.2f}%`" if net_values else "`—`"
+    gross_label = f"`{total_gross:+.2f}%`" if gross_values else "`—`"
+    avg_label = f"`{avg_net:+.2f}%`" if net_values else "`—`"
     embed = discord.Embed(
-        title="📊 Trade Aktif · PnL / ROI",
-        description="`PnL` = perubahan harga · `Net` = estimasi setelah biaya · snapshot saat command dipanggil.",
+        title="PORTFOLIO OVERVIEW",
+        description=(
+            "`LIVE SNAPSHOT`  ·  BYBIT PERPETUALS\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Net PNL merupakan estimasi setelah biaya; nilai dihitung dari posisi yang sedang kamu ikuti."
+        ),
         color=color,
         timestamp=datetime.now(timezone.utc),
     )
+    embed.set_author(name="PREMIUM TRADING DASHBOARD", icon_url="https://www.bybit.com/favicon.ico")
+    embed.add_field(name="NET PNL  ·  EST.", value=f"# {net_label}", inline=True)
+    embed.add_field(name="GROSS PNL", value=f"↗ {gross_label}", inline=True)
+    embed.add_field(name="AVG NET / TRADE", value=avg_label, inline=True)
+    embed.add_field(name="ACTIVE POSITIONS", value=f"`{len(open_recs):02d}`", inline=True)
+    embed.add_field(name="PRICING", value="`MARKET SNAPSHOT`", inline=True)
+    embed.add_field(name="ACCOUNT MODE", value="`PAPER · 1x ROI`", inline=True)
+    embed.add_field(name="━━━━━━━━  OPEN POSITIONS  ━━━━━━━━", value="Rincian posisi · harga diperbarui saat `/trade` dipanggil", inline=False)
     for title, value in fields:
         embed.add_field(name=title, value=value, inline=False)
-    embed.set_footer(text="ROI estimasi 1x (tanpa leverage). Net memperhitungkan estimasi fee, spread, slippage, dan funding; bukan hasil realisasi.")
+    embed.set_footer(text="ROI estimasi 1x tanpa leverage · Fee, spread, slippage & funding diestimasi · Bukan order nyata")
     return embed
 
 
