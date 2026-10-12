@@ -333,38 +333,60 @@ async def live_follow_metrics(rec):
 
 
 async def build_live_trades_embed(user):
-    """Embed privat berisi PnL/ROI berjalan untuk trade yang diikuti user."""
+    """Compact mobile-friendly private embed for followed OPEN paper trades."""
     recs = await db.user_follows(user.id, 200)
     open_recs = [r for r in recs if r.get("status") == "OPEN"][:20]
     if not open_recs:
-        embed = discord.Embed(title="📈 Trade Aktif Kamu", description="Belum ada trade yang sedang berjalan. Tekan **Ikut Trade** pada sinyal aktif untuk mulai mengikuti.", color=discord.Color.blurple())
-        embed.set_footer(text="Paper trading · PnL/ROI estimasi, bukan order atau saldo nyata.")
+        embed = discord.Embed(
+            title="📊 Trade Aktif",
+            description="Belum ada trade berjalan. Tekan **Ikut Trade** pada sinyal aktif untuk mulai mengikuti.",
+            color=discord.Color.blurple(),
+        )
+        embed.set_footer(text="Paper trading · Snapshot Bybit saat /trade dipanggil · Bukan order nyata")
         return embed
-    fields = []
+
     net_values = []
+    fields = []
     for rec in open_recs:
         live = await live_follow_metrics(rec)
         side = "L" if rec.get("direction") == "LONG" else "S"
-        direction_icon = "🟢" if side == "L" else "🔴"
-        title = f'{direction_icon} {rec["symbol"]} {side} · {rec["timeframe"]}m'
+        side_label = "LONG" if side == "L" else "SHORT"
+        age_ts = _ts(rec.get("followed_at"))
+        age = f'<t:{age_ts}:R>' if age_ts else "waktu tidak tersedia"
+        entry = float(rec.get("follow_price") or 0)
+        sl = float(rec.get("sl") or 0)
+        tp = float(rec.get("tp") or 0)
+        title = f'{"🟢" if side == "L" else "🔴"} {rec["symbol"]} · {side_label} · {rec["timeframe"]}m  |  OPEN'
         if live:
             pnl = live["move_pct"]
             net = live["net_pct"]
             net_values.append(net)
-            pnl_icon = "🟩" if pnl >= 0 else "🟥"
-            age = f'<t:{live["age_ts"]}:R>' if live["age_ts"] else "waktu tidak tersedia"
-            value = (f'{pnl_icon} **PnL harga: {pnl:+.2f}%** · **ROI estimasi (1x): {pnl:+.2f}%**\n'
-                     f'Net estimasi setelah biaya: **{net:+.2f}%**\n'
-                     f'Entry `{fmt_price(float(rec["follow_price"]))}` → Harga `{fmt_price(live["price"])}`\n'
-                     f'SL `{fmt_price(float(rec.get("sl") or 0))}` · TP `{fmt_price(float(rec.get("tp") or 0))}` · mulai {age}')
+            sign_icon = "🟢" if net >= 0 else "🔴"
+            value = (
+                f'**PnL {pnl:+.2f}%**  ·  **Net {net:+.2f}%**\n'
+                f'ROI (1x) **{pnl:+.2f}%**\n'
+                f'`Entry {fmt_price(entry)}` → `{fmt_price(live["price"])}`\n'
+                f'`SL {fmt_price(sl)}`  ·  `TP {fmt_price(tp)}`\n'
+                f'{sign_icon} Diikuti {age}'
+            )
         else:
-            value = f'⚪ Harga saat ini belum tersedia\nEntry `{fmt_price(float(rec.get("follow_price") or 0))}` · <t:{_ts(rec.get("followed_at"))}:R>'
+            value = (
+                f'⚪ **PnL / ROI: data harga belum tersedia**\n'
+                f'`Entry {fmt_price(entry)}`  ·  `SL {fmt_price(sl)}`  ·  `TP {fmt_price(tp)}`\n'
+                f'⏱ Diikuti {age}'
+            )
         fields.append((title, value[:1024]))
-    color = discord.Color.green() if net_values and sum(net_values) >= 0 else discord.Color.red() if net_values else discord.Color.blurple()
-    embed = discord.Embed(title="📈 Trade Aktif Kamu · PnL / ROI", description="Snapshot harga Bybit saat command dipanggil. Angka berubah mengikuti harga; bukan order nyata.", color=color, timestamp=datetime.now(timezone.utc))
+
+    color = (discord.Color.green() if sum(net_values) >= 0 else discord.Color.red()) if net_values else discord.Color.blurple()
+    embed = discord.Embed(
+        title="📊 Trade Aktif · PnL / ROI",
+        description="`PnL` = perubahan harga · `Net` = estimasi setelah biaya · snapshot saat command dipanggil.",
+        color=color,
+        timestamp=datetime.now(timezone.utc),
+    )
     for title, value in fields:
         embed.add_field(name=title, value=value, inline=False)
-    embed.set_footer(text="ROI dihitung tanpa leverage (1x); Net = PnL harga dikurangi estimasi fee, spread, slippage, dan funding. Belum termasuk efek leverage/liquidation.")
+    embed.set_footer(text="ROI estimasi 1x (tanpa leverage). Net memperhitungkan estimasi fee, spread, slippage, dan funding; bukan hasil realisasi.")
     return embed
 
 
