@@ -1,20 +1,112 @@
-"""Redis-backed persistent store: riwayat sinyal + Follow Trade. Requires REDIS_URL on Railway."""
+"""Persistent signal/follow store using Upstash Redis REST API (async via aiohttp)."""
 import os, json
 from datetime import datetime, timezone
+import aiohttp
+
+
+class UpstashPipeline:
+    """Small pipeline wrapper for the Redis commands used by this bot."""
+    def __init__(self, client):
+        self.client = client
+        self.commands = []
+
+    def _add(self, *args):
+        self.commands.append([str(a) for a in args])
+        return self
+
+    def set(self, *args, **kwargs):
+        key, value = args[:2]
+        cmd = ["SET", key, value]
+        if kwargs.get("ex") is not None: cmd += ["EX", int(kwargs["ex"])]
+        if kwargs.get("nx"): cmd += ["NX"]
+        return self._add(*cmd)
+
+    def zadd(self, key, mapping):
+        cmd = ["ZADD", key]
+        for member, score in mapping.items(): cmd += [score, member]
+        return self._add(*cmd)
+
+    def sadd(self, key, *members): return self._add("SADD", key, *members)
+    def zrem(self, key, *members): return self._add("ZREM", key, *members)
+    def delete(self, *keys): return self._add("DEL", *keys)
+
+    async def __aenter__(self): return self
+    async def __aexit__(self, exc_type, exc, tb): return False
+    async def execute(self):
+        if not self.commands: return []
+        return await self.client.execute_pipeline(self.commands)
+
+
+class UpstashRedisREST:
+    """Subset of Redis async API implemented over Upstash's REST pipeline endpoint."""
+    def __init__(self, url, token):
+        self.url = url.rstrip("/")
+        self.token = token
+        self.session = None
+
+    async def connect(self):
+        timeout = aiohttp.ClientTimeout(total=15, connect=8)
+        self.session = aiohttp.ClientSession(timeout=timeout, headers={
+            "Authorization": f"Bearer {self.token}", "Content-Type": "application/json"})
+        await self.ping()
+
+    async def execute_pipeline(self, commands):
+        if self.session is None: raise RuntimeError("Upstash REST client belum tersambung")
+        async with self.session.post(self.url + "/pipeline", json=commands) as response:
+            body = await response.json(content_type=None)
+            if response.status >= 400:
+                raise RuntimeError(f"Upstash Redis REST HTTP {response.status}: {str(body)[:500]}")
+        if not isinstance(body, list): raise RuntimeError(f"Respons Upstash pipeline tidak valid: {str(body)[:300]}")
+        results = []
+        for item in body:
+            if isinstance(item, dict) and item.get("error"):
+                raise RuntimeError(f"Upstash Redis command error: {item['error']}")
+            results.append(item.get("result") if isinstance(item, dict) else item)
+        return results
+
+    async def _cmd(self, *args): return (await self.execute_pipeline([[str(a) for a in args]]))[0]
+    async def ping(self): return await self._cmd("PING")
+    async def get(self, key): return await self._cmd("GET", key)
+    async def exists(self, key): return int(await self._cmd("EXISTS", key) or 0)
+    async def incr(self, key): return int(await self._cmd("INCR", key))
+    async def zrevrange(self, key, start, stop): return await self._cmd("ZREVRANGE", key, start, stop) or []
+    async def zcard(self, key): return int(await self._cmd("ZCARD", key) or 0)
+    async def zrem(self, key, *members): return await self._cmd("ZREM", key, *members)
+    async def zadd(self, key, mapping):
+        args = ["ZADD", key]
+        for member, score in mapping.items(): args += [score, member]
+        return await self._cmd(*args)
+    async def set(self, key, value, nx=False, ex=None):
+        args = ["SET", key, value]
+        if ex is not None: args += ["EX", int(ex)]
+        if nx: args += ["NX"]
+        return await self._cmd(*args)
+    async def delete(self, *keys): return await self._cmd("DEL", *keys)
+    async def sadd(self, key, *members): return await self._cmd("SADD", key, *members)
+    async def scard(self, key): return int(await self._cmd("SCARD", key) or 0)
+    async def smembers(self, key): return await self._cmd("SMEMBERS", key) or []
+    async def mget(self, keys):
+        if not keys: return []
+        return await self._cmd("MGET", *keys) or []
+    def pipeline(self, transaction=True): return UpstashPipeline(self)
+    async def aclose(self):
+        if self.session:
+            await self.session.close()
+            self.session = None
 
 
 class Database:
     def __init__(self):
-        self.url = os.getenv("REDIS_URL", "").strip()
+        self.url = os.getenv("UPSTASH_REDIS_REST_URL", "").strip()
+        self.token = os.getenv("UPSTASH_REDIS_REST_TOKEN", "").strip()
         self.redis = None
         self.prefix = os.getenv("REDIS_PREFIX", "bybit_signal_bot")
 
     async def connect(self):
-        if not self.url:
-            raise RuntimeError("REDIS_URL belum diisi. Tambahkan Redis service lalu hubungkan REDIS_URL ke service bot.")
-        from redis.asyncio import Redis
-        self.redis = Redis.from_url(self.url, decode_responses=True, health_check_interval=30, socket_connect_timeout=10, socket_timeout=10)
-        await self.redis.ping()
+        if not self.url or not self.token:
+            raise RuntimeError("UPSTASH_REDIS_REST_URL dan UPSTASH_REDIS_REST_TOKEN wajib diisi dari dashboard Upstash Redis.")
+        self.redis = UpstashRedisREST(self.url, self.token)
+        await self.redis.connect()
 
     def key(self, suffix): return f"{self.prefix}:{suffix}"
 
@@ -40,7 +132,7 @@ class Database:
                   "direction": s["direction"], "score": int(s["score"]), "entry": float(s["entry"]),
                   "stop_loss": float(s["sl"]), "take_profit": float(s["tp"]), "rr": float(s.get("rr") or 0),
                   "status": "OPEN", "outcome": None, "closed_at": None, "candle_start": s.get("candle_start"),
-                  "spread_pct": s.get("spread_pct"), "funding_pct": s.get("funding_pct"),
+                  "strategy": s.get("strategy", "PULLBACK"), "spread_pct": s.get("spread_pct"), "funding_pct": s.get("funding_pct"),
                   "close_price": None, "result_r": None, "net_r": None, "fee_r": None,
                   "channel_id": None, "message_id": None}
         async with self.redis.pipeline(transaction=True) as p:
@@ -119,6 +211,7 @@ class Database:
                "followed_at": now.isoformat(), "follow_price": float(follow_price),
                "symbol": signal["symbol"], "timeframe": signal["timeframe"], "direction": signal["direction"],
                "signal_entry": signal["entry"], "sl": signal["stop_loss"], "tp": signal["take_profit"],
+               "strategy": signal.get("strategy", "PULLBACK"), "spread_pct": signal.get("spread_pct", 0.0),
                "status": "OPEN", "result_r": None, "net_r": None, "close_price": None, "closed_at": None}
         ok = await self.redis.set(self.key(f"follow:{sid}:{user_id}"), json.dumps(rec, separators=(",", ":")), nx=True)
         if not ok: return None

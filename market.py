@@ -38,7 +38,7 @@ def _env_float(name, default):
 
 
 # ---------------- Konfigurasi metode Trend Pullback ----------------
-TP_R = max(0.5, _env_float("TP_R", 1.0))                  # TP = TP_R x jarak SL (1.0 = target winrate tinggi)
+TP_R = max(0.5, _env_float("TP_R", 1.5))                  # target awal momentum; wajib diuji dengan backtest
 ADX_MIN = _env_float("ADX_MIN", 20)                       # ADX 30m minimal (filter sideways)
 PULLBACK_LOOKBACK = int(_env_float("PULLBACK_LOOKBACK", 8))  # candle terakhir yang dicek untuk pullback
 MAX_EXTENDED_ATR = _env_float("MAX_EXTENDED_ATR", 1.5)    # anti-chase: maks jarak close dari EMA20 (x ATR)
@@ -50,6 +50,16 @@ MAX_SPREAD_PCT = _env_float("MAX_SPREAD_PCT", 0.10)
 BTC_FILTER = os.getenv("BTC_FILTER", "1").strip().lower() not in ("0", "false", "no", "off")
 BTC_DUMP_ATR = _env_float("BTC_DUMP_ATR", 1.5)            # BTC 15m gerak > X ATR dalam 3 candle => blok arah berlawanan
 NEWS_WINDOW_MIN = int(_env_float("NEWS_WINDOW_MIN", 30))
+# Only the two user-selected strategies are enabled.
+SIGNAL_STRATEGY = os.getenv("SIGNAL_STRATEGY", "both").strip().lower()
+if SIGNAL_STRATEGY not in ("breakout_retest", "bb_rsi", "both"):
+    SIGNAL_STRATEGY = "breakout_retest"
+BREAKOUT_LOOKBACK = max(8, int(_env_float("BREAKOUT_LOOKBACK", 20)))
+BREAKOUT_RETEST_BARS = max(1, min(4, int(_env_float("BREAKOUT_RETEST_BARS", 3))))
+BREAKOUT_MIN_VOLUME = max(0.8, _env_float("BREAKOUT_MIN_VOLUME", 1.1))
+BB_RSI_OVERSOLD = min(40.0, max(10.0, _env_float("BB_RSI_OVERSOLD", 35)))
+BB_RSI_OVERBOUGHT = max(60.0, min(90.0, _env_float("BB_RSI_OVERBOUGHT", 65)))
+BB_MAX_ADX_30M = max(5.0, _env_float("BB_MAX_ADX_30M", 25))
 
 
 def _parse_blackouts(raw):
@@ -322,6 +332,11 @@ def add_indicators(df):
     dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
     df["adx"] = dx.ewm(alpha=1/14, adjust=False).mean()
     df["vol_sma20"] = df["volume"].rolling(20).mean()
+    # Bollinger Bands (20, 2) for range/reversal scalping.
+    df["bb_mid"] = close.rolling(20).mean()
+    bb_std = close.rolling(20).std(ddof=0)
+    df["bb_upper"] = df["bb_mid"] + 2.0 * bb_std
+    df["bb_lower"] = df["bb_mid"] - 2.0 * bb_std
     return df
 
 
@@ -450,6 +465,197 @@ def _setup(direction, df, m15, m30, price, atr, btc_move, is_btc, diag):
             "btc_aligned": btc_aligned, "confirm15": True}
 
 
+def _momentum_setup(direction, df, m15, m30, price, atr, btc_move, is_btc, diag):
+    """Breakout/momentum entry pada candle tertutup, selaras tren 30m dan konfirmasi 15m."""
+    long = direction == "LONG"
+    sgn = 1 if long else -1
+    def rej(reason):
+        if diag is not None:
+            diag.setdefault("reasons", []).append(f"{direction}: {reason}")
+        return None
+    e = df.iloc[-1]
+    prev = df.iloc[-(MOMENTUM_LOOKBACK + 1):-1]
+    if len(prev) < MOMENTUM_LOOKBACK:
+        return rej("data breakout belum cukup")
+    adx30 = float(m30["adx"]) if pd.notna(m30["adx"]) else 0.0
+    trend30 = (m30["close"] > m30["ema200"] and m30["ema20"] > m30["ema50"] and m30["close"] > m30["ema50"]) if long else \
+              (m30["close"] < m30["ema200"] and m30["ema20"] < m30["ema50"] and m30["close"] < m30["ema50"])
+    trend15 = (m15["ema20"] > m15["ema50"] and m15["close"] > m15["ema20"]) if long else \
+              (m15["ema20"] < m15["ema50"] and m15["close"] < m15["ema20"])
+    trend_entry = (e["ema20"] > e["ema50"] and e["close"] > e["ema20"]) if long else \
+                  (e["ema20"] < e["ema50"] and e["close"] < e["ema20"])
+    if not trend30 or adx30 < ADX_MIN:
+        return rej(f"tren 30m/ADX tidak valid ({adx30:.0f})")
+    if not trend15:
+        return rej("konfirmasi momentum 15m tidak searah")
+    if not trend_entry:
+        return rej("EMA 5m/15m belum mendukung momentum")
+    breakout_level = float(prev["high"].max()) if long else float(prev["low"].min())
+    breakout = float(e["close"]) > breakout_level if long else float(e["close"]) < breakout_level
+    if not breakout:
+        return rej(f"belum breakout range {MOMENTUM_LOOKBACK} candle")
+    vol_x = float(e["volume"] / e["vol_sma20"]) if pd.notna(e["vol_sma20"]) and e["vol_sma20"] > 0 else 0.0
+    if vol_x < MOMENTUM_MIN_VOLUME:
+        return rej(f"volume breakout {vol_x:.1f}x < {MOMENTUM_MIN_VOLUME:.1f}x")
+    rsi = float(e["rsi"])
+    if (long and not 52 <= rsi <= 75) or (not long and not 25 <= rsi <= 48):
+        return rej(f"RSI momentum di luar rentang ({rsi:.0f})")
+    ext = (float(e["close"]) - float(e["ema20"])) / atr * sgn
+    if ext > MAX_EXTENDED_ATR:
+        return rej(f"breakout terlalu jauh dari EMA20 ({ext:.1f} ATR)")
+    btc_aligned = True
+    if not is_btc and btc_move is not None:
+        if (long and btc_move <= -BTC_DUMP_ATR) or (not long and btc_move >= BTC_DUMP_ATR):
+            return rej(f"BTC 15m bergerak kuat melawan ({btc_move:+.1f} ATR)")
+        btc_aligned = (btc_move >= 0) if long else (btc_move <= 0)
+    swing = float(prev.tail(5)["low"].min()) if long else float(prev.tail(5)["high"].max())
+    sl = swing - 0.15 * atr if long else swing + 0.15 * atr
+    risk = price - sl if long else sl - price
+    if risk <= 0 or risk > SL_ATR_MAX * atr or risk < 0.6 * atr:
+        return rej(f"risiko breakout tidak valid ({risk / atr:.1f} ATR)")
+    risk_pct = risk / price * 100
+    fee_r = FEE_PCT / risk_pct if risk_pct else 999
+    if fee_r > MAX_FEE_R:
+        return rej(f"biaya transaksi terlalu besar ({fee_r:.2f}R)")
+    tp = price + sgn * TP_R * risk
+    score = 25 + min(15, max(0, adx30 - ADX_MIN) * 0.75)
+    score += 15 if trend15 else 0
+    score += 10 if vol_x >= 1.5 else 7
+    score += 15 if (long and 55 <= rsi <= 68) or (not long and 32 <= rsi <= 45) else 8
+    score += 10 if btc_aligned else 0
+    score += 10 if ext <= 0.8 else 5
+    score = int(min(100, round(score)))
+    reasons = [f"Momentum breakout {MOMENTUM_LOOKBACK} candle", f"Tren 30m · ADX {adx30:.0f}", f"Volume {vol_x:.1f}x", f"RSI {rsi:.0f}"]
+    return {"direction": direction, "stage": "TRIGGER", "score": score, "sl": float(sl), "tp": float(tp),
+            "rr": TP_R, "risk_pct": risk_pct, "reward_pct": risk_pct * TP_R, "fee_r": fee_r,
+            "adx": adx30, "vol_x": vol_x, "rsi": rsi, "reasons": reasons,
+            "btc_aligned": btc_aligned, "confirm15": True, "strategy": "MOMENTUM"}
+
+
+def _breakout_retest_setup(direction, df, m15, m30, price, atr, btc_move, is_btc, diag):
+    """Breakout + retest: closed candle must revisit the broken range and hold it."""
+    long = direction == "LONG"
+    sgn = 1 if long else -1
+    def rej(reason):
+        if diag is not None:
+            diag.setdefault("reasons", []).append(f"{direction}: {reason}")
+        return None
+    need = BREAKOUT_LOOKBACK + BREAKOUT_RETEST_BARS + 3
+    if len(df) < need:
+        return rej("data breakout/retest belum cukup")
+    e = df.iloc[-1]
+    prev_range = df.iloc[-(BREAKOUT_LOOKBACK + BREAKOUT_RETEST_BARS + 1):-BREAKOUT_RETEST_BARS]
+    level = float(prev_range["high"].max()) if long else float(prev_range["low"].min())
+    recent = df.iloc[-(BREAKOUT_RETEST_BARS + 1):-1]
+    # Find a recent closed breakout candle, then a later retest candle (the current candle).
+    broke = (recent["close"] > level).any() if long else (recent["close"] < level).any()
+    retest = (float(e["low"]) <= level * 1.002 and float(e["close"]) > level) if long else \
+             (float(e["high"]) >= level * 0.998 and float(e["close"]) < level)
+    if not broke or not retest:
+        return rej("belum ada breakout diikuti retest yang bertahan")
+    adx30 = float(m30["adx"]) if pd.notna(m30["adx"]) else 0.0
+    trend30 = (m30["close"] > m30["ema200"] and m30["ema20"] > m30["ema50"] and m30["close"] > m30["ema50"]) if long else \
+              (m30["close"] < m30["ema200"] and m30["ema20"] < m30["ema50"] and m30["close"] < m30["ema50"])
+    trend15 = (m15["ema20"] > m15["ema50"] and m15["close"] >= m15["ema20"]) if long else \
+              (m15["ema20"] < m15["ema50"] and m15["close"] <= m15["ema20"])
+    if not trend30 or adx30 < ADX_MIN:
+        return rej(f"tren 30m/ADX tidak valid ({adx30:.0f})")
+    if not trend15:
+        return rej("tren 15m tidak searah")
+    vol_x = float(e["volume"] / e["vol_sma20"]) if pd.notna(e["vol_sma20"]) and e["vol_sma20"] > 0 else 0.0
+    if vol_x < BREAKOUT_MIN_VOLUME:
+        return rej(f"volume retest {vol_x:.1f}x < {BREAKOUT_MIN_VOLUME:.1f}x")
+    # Close must hold the level with directional candle and avoid chasing an extended move.
+    if (long and e["close"] <= e["open"]) or (not long and e["close"] >= e["open"]):
+        return rej("candle retest belum mengonfirmasi arah")
+    if abs(float(e["close"]) - level) > 1.0 * atr:
+        return rej("harga terlalu jauh dari level retest")
+    btc_aligned = True
+    if not is_btc and btc_move is not None:
+        if (long and btc_move <= -BTC_DUMP_ATR) or (not long and btc_move >= BTC_DUMP_ATR):
+            return rej(f"BTC bergerak kuat melawan ({btc_move:+.1f} ATR)")
+        btc_aligned = (btc_move >= 0) if long else (btc_move <= 0)
+    swing = float(df.iloc[-(BREAKOUT_RETEST_BARS + 1):]["low"].min()) if long else \
+            float(df.iloc[-(BREAKOUT_RETEST_BARS + 1):]["high"].max())
+    sl = min(swing - 0.15 * atr, level - 0.15 * atr) if long else max(swing + 0.15 * atr, level + 0.15 * atr)
+    risk = price - sl if long else sl - price
+    if risk <= 0 or risk < 0.6 * atr or risk > SL_ATR_MAX * atr:
+        return rej(f"jarak SL tidak valid ({risk / atr:.1f} ATR)")
+    risk_pct = risk / price * 100
+    fee_r = (FEE_PCT / risk_pct) if risk_pct else 999
+    if fee_r > MAX_FEE_R:
+        return rej(f"biaya transaksi terlalu besar ({fee_r:.2f}R)")
+    rsi = float(e["rsi"])
+    score = 35 + min(15, max(0, adx30 - ADX_MIN)) + (15 if vol_x >= 1.5 else 8) + (15 if btc_aligned else 5)
+    score += 10 if abs(float(e["close"]) - level) <= 0.35 * atr else 5
+    score = int(min(100, round(score)))
+    return {"direction": direction, "stage": "TRIGGER", "score": score, "sl": float(sl),
+            "tp": float(price + sgn * TP_R * risk), "rr": TP_R, "risk_pct": risk_pct,
+            "reward_pct": risk_pct * TP_R, "fee_r": fee_r, "adx": adx30, "vol_x": vol_x,
+            "rsi": rsi, "reasons": [f"Breakout {BREAKOUT_LOOKBACK} candle + retest", f"Tren 30m · ADX {adx30:.0f}", f"Volume {vol_x:.1f}x", f"Level {level:.8g}"],
+            "btc_aligned": btc_aligned, "confirm15": True, "strategy": "BREAKOUT_RETEST"}
+
+
+def _bb_rsi_setup(direction, df, m15, m30, price, atr, btc_move, is_btc, diag):
+    """Bollinger + RSI mean reversion; deliberately avoids strong 30m trends."""
+    long = direction == "LONG"
+    sgn = 1 if long else -1
+    def rej(reason):
+        if diag is not None:
+            diag.setdefault("reasons", []).append(f"{direction}: {reason}")
+        return None
+    e, p = df.iloc[-1], df.iloc[-2]
+    if pd.isna(e["bb_lower"]) or pd.isna(e["bb_upper"]) or pd.isna(e["rsi"]):
+        return rej("data Bollinger/RSI belum cukup")
+    adx30 = float(m30["adx"]) if pd.notna(m30["adx"]) else 0.0
+    if adx30 > BB_MAX_ADX_30M:
+        return rej(f"ADX 30m {adx30:.0f} terlalu kuat untuk mean reversion")
+    # Require previous candle to close outside a band and latest candle to close back inside.
+    if long:
+        trigger = float(p["close"]) < float(p["bb_lower"]) and float(e["close"]) > float(e["bb_lower"])
+        rsi_ok = float(p["rsi"]) <= BB_RSI_OVERSOLD and float(e["rsi"]) > float(p["rsi"])
+        candle_ok = float(e["close"]) > float(e["open"])
+    else:
+        trigger = float(p["close"]) > float(p["bb_upper"]) and float(e["close"]) < float(e["bb_upper"])
+        rsi_ok = float(p["rsi"]) >= BB_RSI_OVERBOUGHT and float(e["rsi"]) < float(p["rsi"])
+        candle_ok = float(e["close"]) < float(e["open"])
+    if not trigger:
+        return rej("belum kembali masuk Bollinger Band setelah menyimpang")
+    if not rsi_ok or not candle_ok:
+        return rej("RSI/candle belum mengonfirmasi reversal")
+    btc_aligned = True
+    if not is_btc and btc_move is not None:
+        if (long and btc_move <= -BTC_DUMP_ATR) or (not long and btc_move >= BTC_DUMP_ATR):
+            return rej(f"BTC bergerak kuat melawan ({btc_move:+.1f} ATR)")
+        btc_aligned = (btc_move >= 0) if long else (btc_move <= 0)
+    # Stop beyond the reversal extreme; target is the BB midline or configured R target, whichever is closer.
+    sl = (min(float(p["low"]), float(e["low"])) - 0.15 * atr) if long else \
+         (max(float(p["high"]), float(e["high"])) + 0.15 * atr)
+    risk = price - sl if long else sl - price
+    if risk <= 0 or risk < 0.5 * atr or risk > SL_ATR_MAX * atr:
+        return rej(f"jarak SL tidak valid ({risk / atr:.1f} ATR)")
+    mid = float(e["bb_mid"])
+    target_r = price + sgn * TP_R * risk
+    tp = min(mid, target_r) if long else max(mid, target_r)
+    reward = (tp - price) * sgn
+    if reward <= 0 or reward / risk < 0.7:
+        return rej("target ke BB mid terlalu dekat dibanding risiko")
+    risk_pct = risk / price * 100
+    fee_r = FEE_PCT / risk_pct if risk_pct else 999
+    if fee_r > MAX_FEE_R:
+        return rej(f"biaya transaksi terlalu besar ({fee_r:.2f}R)")
+    vol_x = float(e["volume"] / e["vol_sma20"]) if pd.notna(e["vol_sma20"]) and e["vol_sma20"] > 0 else 0.0
+    score = 40 + (20 if abs(float(p["rsi"]) - (BB_RSI_OVERSOLD if long else BB_RSI_OVERBOUGHT)) <= 5 else 10)
+    score += 15 if vol_x >= 1.0 else 5
+    score += 10 if btc_aligned else 0
+    score = int(min(100, round(score)))
+    return {"direction": direction, "stage": "TRIGGER", "score": score, "sl": float(sl), "tp": float(tp),
+            "rr": reward / risk, "risk_pct": risk_pct, "reward_pct": reward / price * 100,
+            "fee_r": fee_r, "adx": adx30, "vol_x": vol_x, "rsi": float(e["rsi"]),
+            "reasons": ["Bollinger Band re-entry", f"RSI reversal {float(p['rsi']):.0f}→{float(e['rsi']):.0f}", f"ADX 30m {adx30:.0f}", f"Volume {vol_x:.1f}x"],
+            "btc_aligned": btc_aligned, "confirm15": True, "strategy": "BB_RSI"}
+
+
 async def analyze_symbol(client: BybitMarket, symbol: str, entry_tf: str = "5", ticker=None, diag=None) -> Optional[dict]:
     """Analisis Trend Pullback. `diag` (dict, opsional) diisi alasan penolakan untuk ditampilkan ke user."""
     if entry_tf not in INTERVALS:
@@ -492,7 +698,14 @@ async def analyze_symbol(client: BybitMarket, symbol: str, entry_tf: str = "5", 
         except Exception as exc:
             log.warning("Filter BTC dilewati (data BTC gagal): %s", exc)
 
-    cands = [c for c in (_setup(d, df, m15, m30, price, atr, btc_move, is_btc, diag) for d in ("LONG", "SHORT")) if c]
+    # Run only the selected strategy, or both user-approved strategies when explicitly configured.
+    strategy_fns = {
+        "breakout_retest": (_breakout_retest_setup,),
+        "bb_rsi": (_bb_rsi_setup,),
+        "both": (_breakout_retest_setup, _bb_rsi_setup),
+    }[SIGNAL_STRATEGY]
+    cands = [c for fn in strategy_fns for c in
+             (fn(d, df, m15, m30, price, atr, btc_move, is_btc, diag) for d in ("LONG", "SHORT")) if c]
     if not cands:
         if diag is not None and diag.get("reasons"):
             rs = diag["reasons"]
@@ -500,6 +713,12 @@ async def analyze_symbol(client: BybitMarket, symbol: str, entry_tf: str = "5", 
             diag["reasons"] = (useful or rs)[:2]
         return None
     best = max(cands, key=lambda c: (c["stage"] == "TRIGGER", c["score"]))
+    # Filter ulang memakai estimasi biaya round-trip: fee taker + spread pasar.
+    # Ini lebih relevan untuk optimasi net R daripada fee saja.
+    total_cost_pct = FEE_PCT + spread_pct
+    best["fee_r"] = total_cost_pct / best["risk_pct"] if best.get("risk_pct") else 999.0
+    if best["fee_r"] > MAX_FEE_R:
+        return reject(f"fee + spread memakan {best['fee_r']:.2f}R (batas {MAX_FEE_R:.2f}R)")
 
     funding = ticker.get("fundingRate")
     try:
@@ -508,6 +727,7 @@ async def analyze_symbol(client: BybitMarket, symbol: str, entry_tf: str = "5", 
         funding_pct = None
     best.update({
         "symbol": symbol, "timeframe": entry_tf, "entry": price, "candle_start": int(df["start"].iloc[-1]),
+        "strategy": best.get("strategy", SIGNAL_STRATEGY.upper()),
         "spread_pct": spread_pct, "turnover24h": turnover, "atr_pct": atr_pct, "funding_pct": funding_pct,
         "chart_df": df.tail(150).copy(),  # dipakai chart.py; tidak disimpan ke Redis
     })

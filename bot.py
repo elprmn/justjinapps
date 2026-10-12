@@ -10,7 +10,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from market import BybitMarket, analyze_symbol, fmt_price, INTERVALS, FEE_PCT, MAX_SPREAD_PCT
+from market import BybitMarket, analyze_symbol, fmt_price, INTERVALS, FEE_PCT, MAX_SPREAD_PCT, SIGNAL_STRATEGY
 from chart import render_chart, CHART_ENABLED
 
 logging.basicConfig(level=logging.INFO)
@@ -45,9 +45,9 @@ scan_lock = asyncio.Lock()
 
 class SignalBot(commands.Bot):
     async def setup_hook(self):
-        # Slash command DISYNC PERTAMA, sebelum Redis/Bybit, supaya kegagalan
+        # Slash command DISYNC PERTAMA, sebelum Upstash Redis/Bybit, supaya kegagalan
         # layanan lain tidak membuat command hilang dari Discord.
-        self.add_dynamic_items(FollowButton, HistoryButton)  # tombol persisten: tetap hidup setelah restart/redeploy
+        self.add_dynamic_items(FollowButton, HistoryButton, HistoryFilterButton)  # tombol persisten: tetap hidup setelah restart/redeploy
         await sync_commands()
         await start_services()
         if not scheduled_scan.is_running():
@@ -94,7 +94,7 @@ async def init_db():
     candidate = Database()
     await candidate.connect()  # jika gagal, db tetap None (tidak setengah terhubung)
     db = candidate
-    log.info("Redis signal store connected")
+    log.info("Upstash Redis signal store connected")
 
 
 async def start_services():
@@ -108,7 +108,7 @@ async def start_services():
         try:
             await init_db()
         except Exception:
-            log.exception("Redis belum terhubung (cek REDIS_URL / reference variable Railway). Akan dicoba lagi.")
+            log.exception("Upstash Redis belum terhubung (cek UPSTASH_REDIS_REST_URL dan UPSTASH_REDIS_REST_TOKEN). Akan dicoba lagi.")
 
 
 # ============================================================ helper tampilan
@@ -149,7 +149,7 @@ def signal_embed(s, sid=None, followers=0):
     dot = "🟢" if is_long else "🔴"
     tag = {"SIGNAL": "", "WATCH": " · 👀 WATCH"}.get(tier, " · ⚪ lemah")
     risk, reward = _pct(s["entry"], s["sl"]), _pct(s["tp"], s["entry"])
-    line2 = f'RR 1:{s["rr"]:g} · Skor {s["score"]} · Fee ≈{s.get("fee_r", 0):.2f}R · Spread {s.get("spread_pct", 0):.3f}%'
+    line2 = f'RR 1:{s["rr"]:g} · Skor {s["score"]} · {s.get("strategy", SIGNAL_STRATEGY).upper()} · Biaya ≈{s.get("fee_r", 0):.2f}R · Spread {s.get("spread_pct", 0):.3f}%'
     if s.get("funding_pct") is not None:
         line2 += f' · Fund {s["funding_pct"]:+.3f}%'
     desc = (f'**Entry** `{fmt_price(s["entry"])}` · **SL** `{fmt_price(s["sl"])}` (-{risk:.2f}%) · '
@@ -215,7 +215,32 @@ class HistoryButton(discord.ui.DynamicItem[discord.ui.Button], template=r"fhist"
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
-        await interaction.followup.send(embed=await build_history_embed(interaction.user, "all"), ephemeral=True)
+        await interaction.followup.send(embed=await build_history_embed(interaction.user, "all"), view=make_history_view(), ephemeral=True)
+
+
+class HistoryFilterButton(discord.ui.DynamicItem[discord.ui.Button], template=r"fhist:(?P<mode>all|open|closed)"):
+    def __init__(self, mode: str):
+        labels = {"all": ("Semua", "📋"), "open": ("Berjalan", "⏳"), "closed": ("Selesai", "✅")}
+        label, emoji = labels[mode]
+        super().__init__(discord.ui.Button(label=label, emoji=emoji, style=discord.ButtonStyle.secondary,
+                                           custom_id=f"fhist:{mode}"))
+        self.mode = mode
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match, /):
+        return cls(match["mode"])
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await interaction.followup.send(embed=await build_history_embed(interaction.user, self.mode),
+                                         view=make_history_view(), ephemeral=True)
+
+
+def make_history_view():
+    view = discord.ui.View(timeout=None)
+    for mode in ("all", "open", "closed"):
+        view.add_item(HistoryFilterButton(mode))
+    return view
 
 
 def make_view(sid, closed=False):
@@ -289,6 +314,10 @@ async def build_history_embed(user, mode="all"):
     wins = sum((r.get("net_r") or 0) > 0 for r in closed)
     net = sum(r.get("net_r") or 0 for r in closed)
     wr = wins / len(closed) * 100 if closed else 0
+    gains = sum(max(0.0, float(r.get("net_r") or 0)) for r in closed)
+    losses = abs(sum(min(0.0, float(r.get("net_r") or 0)) for r in closed))
+    pf = gains / losses if losses else (float("inf") if gains else 0.0)
+    avg_net = net / len(closed) if closed else 0.0
     shown = {"open": open_, "closed": closed}.get(mode, recs)[:12]
     lines = []
     for r in shown:
@@ -297,12 +326,13 @@ async def build_history_embed(user, mode="all"):
             lines.append(f'⏳ **{r["symbol"]}** {side}·{r["timeframe"]}m · #{r["signal_id"]} @ `{fmt_price(r["follow_price"])}` · <t:{_ts(r["followed_at"])}:R>')
         else:
             lines.append(f'{OUTCOME_ICON.get(r["status"], "")} **{r["symbol"]}** {side}·{r["timeframe"]}m · {r["status"]} · '
-                         f'**{(r.get("net_r") or 0):+.2f}R** · <t:{_ts(r["closed_at"])}:R>')
-    head = (f'Selesai **{len(closed)}** · Win **{wins}** · Loss **{len(closed) - wins}** · WR **{wr:.0f}%** · Net **{net:+.2f}R**'
-            f' · Berjalan **{len(open_)}**')
+                         f'**{(r.get("net_r") or 0):+.2f}R net** · keluar `{fmt_price(r.get("close_price") or 0)}` · {r.get("strategy", "-")} · <t:{_ts(r["closed_at"])}:R>')
+    pf_text = "∞" if pf == float("inf") else f"{pf:.2f}"
+    head = (f'Selesai **{len(closed)}** · Win **{wins}** · Loss **{len(closed) - wins}** · WR **{wr:.1f}%** · Net **{net:+.2f}R**'
+            f' · Avg **{avg_net:+.2f}R** · PF **{pf_text}** · Berjalan **{len(open_)}**')
     desc = head + "\n\n" + ("\n".join(lines) if lines else "_Belum ada trade. Tekan **Ikut Trade** pada sinyal baru._")
     embed = discord.Embed(title=f"📋 Riwayat Follow · {user.display_name}", description=desc[:4000], color=discord.Color.blurple())
-    embed.set_footer(text=f"Net = setelah fee ≈{FEE_PCT:g}% pulang-pergi. Simulasi, bukan order nyata. Menampilkan {len(shown)} terbaru.")
+    embed.set_footer(text=f"Net = estimasi fee {FEE_PCT:g}% + spread saat sinyal. Simulasi, bukan order nyata. Menampilkan {len(shown)} terbaru.")
     return embed
 
 
@@ -315,15 +345,16 @@ async def settle_follows(sig, outcome, close_price, closed_at):
         if f.get("status") != "OPEN":
             continue
         fp = f["follow_price"]
-        risk = abs(fp - sl) or abs(sig["entry"] - sl) or 1e-12
-        if outcome == "TP":
-            gross = ((tp - fp) if long else (fp - tp)) / risk
-        elif outcome in ("SL", "AMBIGUOUS"):
-            gross = -1.0
-        else:  # EXPIRED: tutup di harga terakhir
-            gross = ((close_price - fp) if long else (fp - close_price)) / risk
-        fee_r = FEE_PCT / (risk / fp * 100) if fp else 0.0
-        rec = await db.update_follow(sid, f["user_id"], status=outcome, result_r=gross, net_r=gross - fee_r,
+        # R dihitung dari entry follower ke SL, bukan dari entry sinyal. Ini menjaga
+        # hasil konsisten saat pengguna follow pada harga berbeda.
+        risk = abs(fp - sl) or 1e-12
+        exit_price = sl if outcome in ("SL", "AMBIGUOUS") else tp if outcome == "TP" else close_price
+        gross = ((exit_price - fp) if long else (fp - exit_price)) / risk
+        risk_pct = risk / fp * 100 if fp else 0.0
+        # Estimasi round-trip: fee taker + spread saat sinyal. Bukan simulasi slippage sempurna.
+        cost_pct = FEE_PCT + float(sig.get("spread_pct") or 0.0)
+        fee_r = cost_pct / risk_pct if risk_pct else 0.0
+        rec = await db.update_follow(sid, f["user_id"], status=outcome, result_r=gross, fee_r=fee_r, net_r=gross - fee_r,
                                      close_price=close_price, closed_at=closed_at)
         if rec:
             done.append(rec)
@@ -432,7 +463,8 @@ def signal_result_r(sig, outcome, close_price):
     else:
         gross = ((close_price - entry) if long else (entry - close_price)) / risk
     risk_pct = risk / entry * 100
-    fee_r = FEE_PCT / risk_pct if risk_pct else 0.0
+    cost_pct = FEE_PCT + float(sig.get("spread_pct") or 0.0)
+    fee_r = cost_pct / risk_pct if risk_pct else 0.0
     return gross, fee_r, gross - fee_r
 
 
@@ -495,7 +527,7 @@ def _alert_problem():
     if market is None:
         return "market data belum aktif"
     if db is None:
-        return "Redis belum terhubung (cek REDIS_URL / reference variable Railway)"
+        return "Upstash Redis belum terhubung (cek UPSTASH_REDIS_REST_URL dan UPSTASH_REDIS_REST_TOKEN)"
     if not ALERT_CHANNEL_ID.isdigit():
         return "ALERT_CHANNEL_ID belum diisi / bukan angka"
     return None
@@ -596,7 +628,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
     original = getattr(error, "original", error)
     log.error("Slash command /%s error: %r", getattr(interaction.command, "name", "?"), original, exc_info=original)
     if isinstance(original, AttributeError) and (market is None or db is None):
-        msg = "Layanan (Redis/market data) belum siap. Cek Deploy Logs Railway, lalu coba lagi."
+        msg = "Layanan (Upstash Redis/market data) belum siap. Cek Deploy Logs Railway, lalu coba lagi."
     else:
         msg = f"Terjadi error: {original}"
     try:
@@ -612,7 +644,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 async def alert_diagnostics():
     """Ringkasan kesehatan alert otomatis untuk /status."""
     lines = ["**Alert otomatis**"]
-    lines.append(f"Redis: {'✅ terhubung' if db else '❌ belum terhubung'}")
+    lines.append(f"Upstash Redis: {'✅ terhubung' if db else '❌ belum terhubung'}")
     ch = await get_alert_channel() if ALERT_CHANNEL_ID.isdigit() else None
     if ch is None:
         lines.append("Channel alert: ❌ tidak valid / tidak bisa diakses (cek ALERT_CHANNEL_ID)")
@@ -717,7 +749,7 @@ async def history(interaction: discord.Interaction):
 async def riwayat(interaction: discord.Interaction, tampilkan: Optional[app_commands.Choice[str]] = None):
     await interaction.response.defer(ephemeral=True)
     mode = tampilkan.value if tampilkan else "all"
-    await interaction.followup.send(embed=await build_history_embed(interaction.user, mode), ephemeral=True)
+    await interaction.followup.send(embed=await build_history_embed(interaction.user, mode), view=make_history_view(), ephemeral=True)
 
 
 @bot.tree.command(name="performance", description="Statistik hasil evaluasi sinyal")
