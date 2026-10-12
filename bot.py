@@ -503,71 +503,136 @@ async def build_live_trades_embed(user):
 
 
 def render_modern_card_dashboard(positions, total_net, total_gross, avg_net, display_name):
-    """Render a mobile-first Modern Card PNG. All values come from the live /trade snapshot."""
+    """Render a reference-inspired, mobile-first Modern Card PNG from the live /trade snapshot."""
     from PIL import Image, ImageDraw, ImageFont
-    import math
 
     width = 1100
-    pad = 54
-    card_h = 250
-    gap = 24
-    height = 390 + (card_h + gap) * max(1, min(len(positions), 12)) + 70
-    height = min(height, 390 + (card_h + gap) * 12 + 70)
-    im = Image.new("RGB", (width, height), (7, 14, 27))
+    pad = 48
+    card_gap = 22
+    card_h = 420
+    shown = list(positions[:12])
+    header_h = 168
+    portfolio_h = 150
+    footer_h = 68
+    section_h = 62
+    # Compute canvas from actual content so no position card is clipped or skipped.
+    height = pad + header_h + 24 + len(shown) * card_h + max(0, len(shown)-1) * card_gap + section_h + portfolio_h + footer_h + pad
+    im = Image.new("RGB", (width, height), (5, 13, 27))
     d = ImageDraw.Draw(im)
     try:
-        regular = ImageFont.truetype("DejaVuSans.ttf", 25)
-        small = ImageFont.truetype("DejaVuSans.ttf", 20)
-        medium = ImageFont.truetype("DejaVuSans-Bold.ttf", 26)
-        large = ImageFont.truetype("DejaVuSans-Bold.ttf", 54)
-        title_font = ImageFont.truetype("DejaVuSans-Bold.ttf", 34)
-        metric_font = ImageFont.truetype("DejaVuSans-Bold.ttf", 32)
+        regular = ImageFont.truetype("DejaVuSans.ttf", 24)
+        small = ImageFont.truetype("DejaVuSans.ttf", 19)
+        tiny = ImageFont.truetype("DejaVuSans.ttf", 16)
+        medium = ImageFont.truetype("DejaVuSans-Bold.ttf", 25)
+        title_font = ImageFont.truetype("DejaVuSans-Bold.ttf", 31)
+        pnl_font = ImageFont.truetype("DejaVuSans-Bold.ttf", 59)
+        metric_font = ImageFont.truetype("DejaVuSans-Bold.ttf", 35)
     except OSError:
-        regular = small = medium = large = title_font = metric_font = ImageFont.load_default()
+        regular = small = tiny = medium = title_font = pnl_font = metric_font = ImageFont.load_default()
 
-    bg_card = (14, 27, 46); border = (31, 57, 80); white = (239, 246, 255)
-    muted = (148, 169, 194); green = (37, 230, 167); red = (255, 76, 108)
-    d.rounded_rectangle((pad, 34, width-pad, 140), radius=28, fill=(12, 31, 48), outline=(20, 135, 119), width=2)
-    d.text((pad+28, 55), "JUSTJINAPPS  /  TRADING DASHBOARD", font=title_font, fill=white)
-    d.text((pad+30, 105), f"{display_name}  ·  BYBIT PERPETUALS  ·  PAPER TRADING", font=small, fill=muted)
+    bg = (7, 22, 41)
+    card = (8, 25, 46)
+    inner = (5, 19, 37)
+    border = (20, 67, 96)
+    white = (239, 247, 255)
+    muted = (139, 166, 194)
+    green = (0, 224, 166)
+    red = (255, 75, 111)
+    cyan = (0, 199, 229)
 
-    top, bottom = 164, 345
-    box_gap = 18
-    box_w = (width - 2*pad - 2*box_gap)//3
-    metrics = [("NET PNL · EST.", total_net, green if total_net >= 0 else red),
-               ("GROSS PNL", total_gross, green if total_gross >= 0 else red),
-               ("AVG NET / TRADE", avg_net, green if avg_net >= 0 else red)]
-    for i, (label, val, col) in enumerate(metrics):
-        x = pad + i*(box_w+box_gap)
-        d.rounded_rectangle((x, top, x+box_w, bottom), radius=24, fill=bg_card, outline=border, width=2)
-        d.text((x+22, top+24), label, font=small, fill=muted)
-        d.text((x+22, top+72), f"{val:+.2f}%", font=metric_font, fill=col)
-        d.text((x+22, top+126), "LIVE SNAPSHOT", font=small, fill=(93, 119, 149))
+    def rounded(box, radius=24, fill=card, outline=border, w=2):
+        d.rounded_rectangle(box, radius=radius, fill=fill, outline=outline, width=w)
 
-    y = 375
-    d.text((pad, y), f"OPEN POSITIONS  ·  {len(positions):02d}", font=title_font, fill=white)
-    y += 60
-    if not positions:
-        d.rounded_rectangle((pad, y, width-pad, y+150), radius=24, fill=bg_card, outline=border, width=2)
-        d.text((pad+28, y+35), "NO ACTIVE POSITIONS", font=medium, fill=muted)
-        d.text((pad+28, y+83), "Join a signal to see live PNL here.", font=regular, fill=white)
-        y += 150
-    for pos in positions[:12]:
-        if y + card_h > height - 50:
-            break
-        col = green if pos["net"] >= 0 else red
-        d.rounded_rectangle((pad, y, width-pad, y+card_h), radius=24, fill=bg_card, outline=border, width=2)
-        d.rounded_rectangle((pad, y, pad+10, y+card_h), radius=5, fill=col)
-        d.text((pad+30, y+22), f'{pos["symbol"]}  ·  {pos["side"]}  ·  {pos["timeframe"]}M', font=medium, fill=white)
-        d.rounded_rectangle((width-pad-145, y+18, width-pad-30, y+58), radius=18, fill=(14, 74, 63) if pos["net"] >= 0 else (86, 28, 48))
-        d.text((width-pad-128, y+25), "OPEN", font=small, fill=green if pos["net"] >= 0 else red)
-        d.text((pad+30, y+76), f'{pos["net"]:+.2f}% NET', font=large, fill=col)
-        d.text((pad+430, y+85), f'GROSS  {pos["gross"]:+.2f}%', font=medium, fill=muted)
-        d.line((pad+28, y+145, width-pad-28, y+145), fill=border, width=2)
-        d.text((pad+30, y+163), f'ENTRY  {pos["entry"]:.10g}   →   LAST  {pos["last"]:.10g}', font=small, fill=white)
-        d.text((pad+30, y+202), f'SL  {pos["sl"]:.10g}      TP  {pos["tp"]:.10g}      {pos.get("age", "time n/a")}', font=small, fill=muted)
-        y += card_h + gap
-    d.text((pad, height-43), "ROI estimate at 1x · Fees/slippage estimated · No real orders", font=small, fill=muted)
+    # Header / identity block
+    y = pad
+    rounded((pad, y, width-pad, y+header_h), 34, (6, 24, 43), (18, 107, 127), 3)
+    d.ellipse((pad+24, y+28, pad+112, y+116), fill=(13, 67, 105), outline=(25, 151, 187), width=3)
+    d.text((pad+42, y+48), "JJ", font=title_font, fill=white)
+    d.text((pad+132, y+30), "JustJinApps Trading Bot", font=title_font, fill=white)
+    d.text((pad+132, y+78), f"/trade  ·  Positions ({len(shown)})", font=regular, fill=muted)
+    badge_w = 205
+    bx = width-pad-badge_w-24
+    rounded((bx, y+30, bx+badge_w, y+78), 13, (4, 49, 67), (0, 143, 175), 2)
+    d.text((bx+18, y+43), "PAPER TRADING", font=small, fill=cyan)
+
+    y += header_h + 24
+    for idx, pos in enumerate(shown):
+        net = float(pos.get("net", 0) or 0)
+        gross = float(pos.get("gross", 0) or 0)
+        accent = green if net >= 0 else red
+        side = str(pos.get("side", "LONG")).upper()
+        symbol = str(pos.get("symbol", "UNKNOWN"))
+        tf = str(pos.get("timeframe", "?")).replace("m", "")
+        # Full position card
+        rounded((pad, y, width-pad, y+card_h), 30, card, border, 2)
+        # header row
+        d.ellipse((pad+28, y+25, pad+88, y+85), fill=(15, 57, 86), outline=(39, 111, 148), width=2)
+        coin_mark = symbol[:1] if symbol else "?"
+        d.text((pad+46, y+39), coin_mark, font=medium, fill=cyan)
+        d.text((pad+108, y+35), symbol, font=title_font, fill=white)
+        side_color = green if side == "LONG" else red
+        tag_x = pad+108+min(320, int(d.textlength(symbol, font=title_font)))+18
+        tag_x = min(tag_x, width-pad-350)
+        rounded((tag_x, y+32, tag_x+112, y+78), 13, (7, 55, 55) if side == "LONG" else (65, 25, 47), (0, 124, 112) if side == "LONG" else (145, 43, 69), 2)
+        d.text((tag_x+14, y+43), side, font=small, fill=side_color)
+        d.text((tag_x+125, y+42), f"· {tf}m", font=regular, fill=muted)
+        rounded((width-pad-150, y+31, width-pad-27, y+78), 18, (5, 68, 59), (0, 137, 106), 2)
+        d.text((width-pad-128, y+43), "OPEN", font=small, fill=green)
+
+        # PNL hero and entry/last column
+        pnl_top = y+108
+        rounded((pad+25, pnl_top, pad+535, y+292), 22, inner, (12, 46, 72), 1)
+        d.text((pad+47, pnl_top+17), "NET PNL (EST.)", font=small, fill=muted)
+        d.text((pad+42, pnl_top+48), f"{net:+.2f}%", font=pnl_font, fill=accent)
+        d.text((pad+47, pnl_top+128), f"GROSS  {gross:+.2f}%", font=medium, fill=white)
+
+        rx1, rx2 = pad+558, width-pad-25
+        rounded((rx1, pnl_top, rx2, y+292), 22, inner, (12, 46, 72), 1)
+        d.text((rx1+24, pnl_top+18), "ENTRY", font=small, fill=muted)
+        d.text((rx1+24, pnl_top+49), f"{float(pos.get('entry', 0) or 0):,.10g}", font=metric_font, fill=white)
+        d.line((rx1+24, pnl_top+94, rx2-24, pnl_top+94), fill=border, width=2)
+        d.text((rx1+24, pnl_top+108), "LAST PRICE", font=small, fill=muted)
+        d.text((rx1+24, pnl_top+137), f"{float(pos.get('last', 0) or 0):,.10g}", font=metric_font, fill=white)
+
+        # SL / TP chips and age row
+        chip_y = y+315
+        rounded((pad+25, chip_y, pad+330, chip_y+58), 16, (55, 19, 39), (119, 40, 64), 2)
+        d.text((pad+43, chip_y+17), f"SL  {float(pos.get('sl', 0) or 0):,.10g}", font=small, fill=red)
+        rounded((pad+350, chip_y, pad+650, chip_y+58), 16, (4, 48, 48), (0, 111, 94), 2)
+        d.text((pad+368, chip_y+17), f"TP  {float(pos.get('tp', 0) or 0):,.10g}", font=small, fill=green)
+        age = str(pos.get("age", "time n/a"))
+        # Convert Discord-relative timestamp text into compact card text.
+        if age.startswith("<t:"):
+            age = "FOLLOWED"
+        d.text((pad+685, chip_y+18), age[:18], font=small, fill=muted)
+        y += card_h + card_gap
+
+    # Portfolio summary panel modeled after the supplied reference.
+    if not shown:
+        rounded((pad, y, width-pad, y+130), 24, card, border, 2)
+        d.text((pad+28, y+28), "NO ACTIVE POSITIONS", font=medium, fill=muted)
+        d.text((pad+28, y+72), "Follow a signal to see live PNL here.", font=regular, fill=white)
+        y += 130 + 18
+
+    rounded((pad, y, width-pad, y+portfolio_h), 26, card, border, 2)
+    d.text((pad+30, y+24), "PORTFOLIO PNL (NET)", font=small, fill=muted)
+    portfolio_color = green if total_net >= 0 else red
+    d.text((pad+30, y+58), f"{total_net:+.2f}%", font=metric_font, fill=portfolio_color)
+    # vertical divider and active count
+    divider_x = width-pad-300
+    d.line((divider_x, y+22, divider_x, y+portfolio_h-22), fill=border, width=2)
+    d.text((divider_x+28, y+25), "ACTIVE POSITIONS", font=small, fill=muted)
+    d.text((divider_x+28, y+61), f"{len(shown):02d}", font=metric_font, fill=white)
+    d.text((pad+30, y+112), f"Gross {total_gross:+.2f}%   ·   Avg net/trade {avg_net:+.2f}%", font=tiny, fill=muted)
+
+    footer_y = y + portfolio_h + 26
+    d.ellipse((pad+2, footer_y+2, pad+42, footer_y+42), outline=(0, 139, 167), width=2)
+    d.text((pad+14, footer_y+10), "J", font=small, fill=cyan)
+    d.text((pad+56, footer_y+8), "JustJinApps Trading Bot", font=small, fill=muted)
+    footer_text = "PAPER TRADING  ·  ROI ESTIMATE 1x  ·  NO REAL ORDERS"
+    tw = d.textlength(footer_text, font=tiny)
+    d.text((width-pad-tw, footer_y+12), footer_text, font=tiny, fill=cyan)
+
     output = io.BytesIO()
     im.save(output, format="PNG", optimize=True)
     return output.getvalue()
