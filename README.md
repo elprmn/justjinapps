@@ -74,3 +74,19 @@ Tombol Riwayat Saya menyediakan filter Semua/Berjalan/Selesai. Statistik persona
 ## Command `/reset` (administrator only)
 
 `/reset` menampilkan konfirmasi privat. Jika admin menekan **RESET SEMUA DATA**, bot menghapus semua key Upstash yang cocok dengan `REDIS_PREFIX:*` (default `bybit_signal_bot:*`) dan menghapus pesan yang dikirim bot di channel `ALERT_CHANNEL_ID`. Command tidak menggunakan `FLUSHDB`/`FLUSHALL`, tidak menghapus key aplikasi lain di database yang sama, tidak menghapus pesan pengguna atau channel/server Discord, serta tidak menghapus token maupun Environment Variables. Reset menghapus history, sinyal, follow trade, dan dedupe bot sehingga tidak dapat dibatalkan. Pastikan bot punya izin `View Channel`, `Read Message History`, dan `Manage Messages`/izin menghapus pesan di channel alert.
+
+## `/trade` text snapshot + live visual dashboard
+
+`/trade` now replies with a clean text-only snapshot (no Discord embed or PNG attachment) and a personal live dashboard link. The web dashboard is served by the same Railway process, uses a responsive dark glassmorphism theme, and refreshes its live position data every 15 seconds.
+
+Configure these Railway variables:
+
+- `DASHBOARD_BASE_URL`: the app's public HTTPS domain, for example `https://your-app.up.railway.app` (without a trailing slash).
+- `DASHBOARD_SECRET`: a long random secret used to sign per-user dashboard links. If omitted, the bot token is used as the signing secret.
+
+Railway must expose the app's `PORT` (the bot binds the web dashboard to `0.0.0.0:$PORT`). The generated link contains a signed user ID and works as a bearer link: anyone who receives it can view that user's followed positions. Do not share it publicly. The dashboard is read-only and does not place real orders.
+
+### Live web dashboard UI
+
+The private `/trade` dashboard is a responsive dark glassmorphism UI inspired by the JustJinApps visual reference. It includes a sidebar, portfolio PNL summary, active position cards, followed-pair market overview, a current-position PNL visualization, live snapshot stats, and a paper-trading/privacy note. The dashboard refreshes its own data every 15 seconds. Market rows and PNL visualization are based on followed open positions returned by the bot; they are not external market-wide tickers or historical account-performance data.
+

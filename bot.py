@@ -2,6 +2,9 @@ import io
 import os
 import asyncio
 import logging
+import hmac
+import hashlib
+from urllib.parse import quote
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -9,6 +12,7 @@ from database import Database
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
+from aiohttp import web
 
 from market import BybitMarket, analyze_symbol, fmt_price, INTERVALS, FEE_PCT, SLIPPAGE_PCT, MAX_SPREAD_PCT, SIGNAL_STRATEGY
 from chart import render_chart, CHART_ENABLED
@@ -18,6 +22,9 @@ log = logging.getLogger("signalbot")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 GUILD_ID = os.getenv("GUILD_ID", "").strip().strip("\"\'").strip()
 ALERT_CHANNEL_ID = os.getenv("ALERT_CHANNEL_ID", "").strip().strip("\"\'").strip()
+DASHBOARD_BASE_URL = os.getenv("DASHBOARD_BASE_URL", "").strip().rstrip("/")
+DASHBOARD_SECRET = os.getenv("DASHBOARD_SECRET", "").strip() or os.getenv("DISCORD_TOKEN", "")
+_dashboard_runner = None
 SCAN_INTERVAL_SECONDS = max(60, int(os.getenv("SCAN_INTERVAL_SECONDS", "120")))
 MAX_SCAN_SYMBOLS = max(5, min(60, int(os.getenv("MAX_SCAN_SYMBOLS", "25"))))
 MIN_SIGNAL_SCORE = max(50, min(100, int(os.getenv("MIN_SIGNAL_SCORE", "70"))))
@@ -50,6 +57,7 @@ class SignalBot(commands.Bot):
         self.add_dynamic_items(FollowButton, HistoryButton, HistoryFilterButton)  # tombol persisten: tetap hidup setelah restart/redeploy
         await sync_commands()
         await start_services()
+        await start_dashboard_server()
         if not scheduled_scan.is_running():
             scheduled_scan.change_interval(seconds=SCAN_INTERVAL_SECONDS)
             scheduled_scan.start()
@@ -61,6 +69,10 @@ class SignalBot(commands.Bot):
             await market.close()
         if db:
             await db.close()
+        global _dashboard_runner
+        if _dashboard_runner:
+            await _dashboard_runner.cleanup()
+            _dashboard_runner = None
         await super().close()
 
 
@@ -109,6 +121,120 @@ async def start_services():
             await init_db()
         except Exception:
             log.exception("Upstash Redis belum terhubung (cek UPSTASH_REDIS_REST_URL dan UPSTASH_REDIS_REST_TOKEN). Akan dicoba lagi.")
+
+
+# ============================================================ live web dashboard
+DASHBOARD_HTML = r"""<!doctype html>
+<html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#030b18"><title>JustInApps · Live Trading Dashboard</title>
+<style>
+:root{color-scheme:dark;--bg:#030b18;--panel:rgba(5,24,42,.82);--panel2:rgba(8,34,55,.72);--line:#103b55;--muted:#8aaac8;--text:#eaf6ff;--green:#00e6b2;--red:#ff496e;--cyan:#21d7f4;--blue:#168cff}
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:radial-gradient(ellipse at 52% -12%,#0d3555 0,transparent 40%),radial-gradient(ellipse at 5% 90%,#05264a 0,transparent 35%),var(--bg);font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;color:var(--text);min-height:100vh}button{font:inherit}.app{display:grid;grid-template-columns:238px minmax(0,1fr);min-height:100vh}.sidebar{position:sticky;top:0;height:100vh;padding:28px 17px 18px;border-right:1px solid #0b2b43;background:linear-gradient(180deg,rgba(4,20,37,.96),rgba(2,12,25,.96));display:flex;flex-direction:column;gap:26px;overflow:hidden}.sidebar:after{content:"";position:absolute;left:-70px;bottom:90px;width:340px;height:220px;background:linear-gradient(145deg,transparent 36%,#082b4b 37%,#061a32 55%,transparent 56%);opacity:.48;transform:skewY(-18deg);pointer-events:none}.brand{display:flex;align-items:center;gap:12px;padding:2px 7px 22px}.logo{width:46px;height:46px;flex-shrink:0;display:grid;place-items:center;border-radius:15px;background:linear-gradient(135deg,#168bff,#00e6b2);color:white;font-size:24px;font-weight:950;box-shadow:0 0 28px #0b9cff45}.brandname{font-size:17px;font-weight:850;letter-spacing:-.04em}.brandname small{display:block;font-size:12px;color:#8db6dc;font-weight:500;letter-spacing:0;margin-top:3px}.nav{display:grid;gap:8px;position:relative;z-index:1}.nav a{display:flex;align-items:center;gap:13px;text-decoration:none;color:#a8c7e4;padding:13px 14px;border-radius:12px;font-size:14px;border:1px solid transparent}.nav a.active{color:var(--cyan);background:linear-gradient(100deg,#06336a,#082447);border-color:#0b3764;box-shadow:inset 3px 0 var(--cyan),0 5px 20px #00162a}.navicon{width:20px;text-align:center;font-size:18px}.paperbox{position:relative;z-index:1;margin:0 7px;padding:14px;border:1px solid #0a344a;border-radius:15px;background:rgba(3,24,42,.78)}.paper{display:inline-flex;align-items:center;gap:7px;color:var(--green);font-size:10px;font-weight:850;letter-spacing:.08em;padding:6px 8px;border:1px solid #07574e;background:#032d2c;border-radius:999px}.dot{width:7px;height:7px;background:var(--green);border-radius:50%;box-shadow:0 0 10px var(--green)}.paperbox p{font-size:11px;color:var(--muted);line-height:1.5;margin:9px 0 0}.livebox{position:relative;z-index:1;margin-top:auto;border:1px solid #0a344a;background:#06182a;border-radius:14px;padding:13px;display:flex;gap:10px;align-items:center}.liveicon{font-size:22px;color:#66cfff}.livebox b{font-size:12px;display:block}.livebox small{font-size:10px;color:var(--muted)}.live-dot{margin-left:auto;width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 12px var(--green)}.content{min-width:0;padding:27px clamp(16px,2.5vw,38px) 24px;max-width:1600px;width:100%;margin:auto}.topbar{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:24px}.greeting h1{font-size:clamp(19px,2vw,27px);margin:0 0 5px;letter-spacing:-.04em}.greeting p{margin:0;font-size:13px;color:#8db9dc}.topright{display:flex;align-items:center;gap:10px}.clock{border:1px solid #0c3550;background:#051b2e;border-radius:999px;padding:11px 14px;font-size:11px;color:#bdd8f0;white-space:nowrap}.bell{width:39px;height:39px;display:grid;place-items:center;border:1px solid #0d3a56;border-radius:50%;background:#061b2e;color:#c9e8ff}.layout{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(270px,.95fr);gap:18px;align-items:start}.leftcol,.rightcol{display:grid;gap:18px;min-width:0}.panel{border:1px solid #0d3c57;border-radius:19px;background:linear-gradient(145deg,rgba(6,28,48,.88),rgba(2,15,30,.92));box-shadow:0 14px 36px #0002;overflow:hidden;backdrop-filter:blur(18px)}.panelhead{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:18px 19px 0}.paneltitle{font-size:14px;font-weight:750;color:#cde8ff}.panelhint{font-size:10px;color:var(--muted)}.hero{display:grid;grid-template-columns:minmax(150px,1.1fr) minmax(100px,.7fr) minmax(100px,.7fr) minmax(110px,.85fr);gap:18px;align-items:center;padding:24px 25px;position:relative;border-color:#087a77;background:radial-gradient(ellipse at 28% 0%,#06374b 0,transparent 58%),linear-gradient(120deg,rgba(3,39,54,.96),rgba(3,20,36,.94));box-shadow:inset 4px 0 #00e6b2,0 0 35px #00cdb314}.hero:after{content:"";position:absolute;inset:0;pointer-events:none;background:linear-gradient(90deg,transparent,#00e6b207,transparent)}.heroMain,.metric{position:relative;z-index:1;min-width:0}.label{font-size:11px;color:#91b9d9;margin-bottom:9px}.heroValue{font-size:clamp(29px,3.2vw,45px);font-weight:900;letter-spacing:-.055em;line-height:1.1;white-space:nowrap}.heroUsd{font-size:14px;font-weight:700;margin-top:8px}.spark{width:100%;height:58px;margin-top:12px;overflow:visible}.metric{border-left:1px solid #15415a;padding-left:17px}.metric b{display:block;font-size:21px;letter-spacing:-.03em;margin:8px 0 5px}.metric small{font-size:11px;color:#9bbbd3}.sectionhead{display:flex;align-items:center;justify-content:space-between;padding:19px 19px 13px}.sectionhead h2{font-size:15px;margin:0;color:#cde8ff}.viewall{font-size:11px;color:var(--cyan);border:1px solid #0b3c56;background:#06233a;border-radius:10px;padding:8px 11px}.positions{padding:0 10px 10px;display:grid;gap:12px}.position{border:1px solid #0d4a65;border-radius:17px;background:linear-gradient(135deg,rgba(5,31,51,.94),rgba(2,17,33,.98));overflow:hidden;box-shadow:inset 0 1px #a6efff08}.poshead{display:flex;align-items:center;gap:11px;padding:15px 16px 8px}.coin{width:43px;height:43px;display:grid;place-items:center;border-radius:50%;font-size:20px;font-weight:900;background:linear-gradient(145deg,#ffb23e,#e87908);color:white;box-shadow:0 4px 18px #f99b2525;flex-shrink:0}.coin.alt{background:linear-gradient(145deg,#4acbff,#0875e8)}.symbol{font-size:17px;font-weight:850;letter-spacing:-.03em}.tag{font-size:11px;font-weight:850;color:var(--green);background:#053c39;border:1px solid #087d6e;border-radius:9px;padding:7px 9px;white-space:nowrap}.tag.short{color:#ff7997;background:#401b30;border-color:#71334c}.timeframe{font-size:11px;color:#b6d7ef;background:#09243a;padding:7px 9px;border-radius:9px;margin-left:-7px;white-space:nowrap}.spacer{flex:1}.status{font-size:11px;font-weight:900;color:var(--green);background:#064a43;border:1px solid #087a69;padding:8px 10px;border-radius:10px}.posmain{display:grid;grid-template-columns:minmax(0,1fr) minmax(145px,.7fr);gap:14px;padding:9px 18px 17px;align-items:center}.pnl{font-size:clamp(34px,4vw,48px);font-weight:950;letter-spacing:-.06em;line-height:1.05;white-space:nowrap}.usd{font-size:15px;font-weight:700;margin-top:7px}.prices{border-left:1px solid #12415a;padding-left:17px;display:grid;gap:10px}.price{display:flex;justify-content:space-between;align-items:center;gap:10px;font-size:13px}.price span{color:#9cc5e4}.price b{font-size:14px;white-space:nowrap}.levels{display:flex;align-items:center;gap:9px;flex-wrap:wrap;padding:0 17px 16px}.level{font-size:11px;font-weight:750;color:#ff6483;background:#281629;border:1px solid #64263e;border-radius:10px;padding:9px 11px;white-space:nowrap}.level.tp{color:var(--green);background:#032d2c;border-color:#086456}.age{margin-left:auto;color:#a1c2df;font-size:12px;white-space:nowrap}.rightpanel{padding-bottom:14px}.marketlist{padding:8px 16px 0;display:grid}.marketrow{display:grid;grid-template-columns:29px minmax(70px,1fr) auto auto;gap:9px;align-items:center;padding:12px 0;border-bottom:1px solid #0b2d45;font-size:12px}.marketrow:last-child{border-bottom:0}.marketcoin{width:28px;height:28px;border-radius:50%;display:grid;place-items:center;background:#123c57;font-weight:900;color:#e6f8ff}.marketname{font-weight:650;overflow:hidden;text-overflow:ellipsis}.marketprice{color:#d8ecfb;font-weight:750}.change{font-weight:800;color:var(--green)}.chartpanel{padding-bottom:15px}.charttools{display:flex;gap:6px}.charttools span{font-size:10px;color:#9bc6e7;padding:6px 8px;border-radius:8px}.charttools span.active{color:var(--cyan);background:#073352;border:1px solid #0b6a91}.chartwrap{padding:17px 15px 0}.chartlegend{display:flex;justify-content:space-between;color:#86aac8;font-size:10px;margin-top:8px}.chartsvg{width:100%;height:auto;display:block}.statsgrid{padding:14px 16px 0;display:grid;grid-template-columns:1fr 1fr;gap:9px}.statbox{border:1px solid #0d344c;background:#061b2d;border-radius:12px;padding:12px}.statbox span{display:block;font-size:11px;color:#91b8d7}.statbox b{display:block;font-size:19px;margin-top:7px}.footer{display:flex;align-items:center;justify-content:space-between;gap:12px;color:#668ba9;font-size:11px;padding:22px 3px 0}.footer strong{color:#9ec8e7;font-weight:650}.footright{color:var(--cyan)}.empty{margin:0 8px 10px;padding:30px 16px;text-align:center;color:var(--muted);border:1px dashed #17445d;border-radius:15px;font-size:13px}.hidden{display:none!important}
+@media(max-width:1100px){.app{grid-template-columns:190px minmax(0,1fr)}.sidebar{padding:20px 11px}.layout{grid-template-columns:minmax(0,1.3fr) minmax(245px,.8fr);gap:12px}.hero{grid-template-columns:1.2fr .8fr .8fr;gap:12px;padding:20px}.metric:last-child{display:none}.content{padding:20px 16px}.posmain{grid-template-columns:minmax(0,1fr) minmax(125px,.75fr);padding-left:14px;padding-right:14px}}
+@media(max-width:760px){.app{display:block}.sidebar{position:relative;height:auto;padding:13px 14px;border-right:0;border-bottom:1px solid #0c3049;display:block}.brand{padding:0;gap:10px}.logo{width:38px;height:38px;font-size:20px}.brandname{font-size:15px}.brandname small{font-size:10px}.nav{display:flex;overflow:auto;gap:6px;margin-top:13px}.nav a{white-space:nowrap;padding:9px 11px;font-size:11px;gap:7px}.navicon{font-size:14px;width:auto}.paperbox,.livebox{display:none}.content{padding:17px 12px 22px}.topbar{align-items:flex-start;margin-bottom:16px}.greeting h1{font-size:19px}.greeting p{font-size:11px;line-height:1.4}.topright{gap:0}.clock{font-size:9px;padding:9px 10px}.bell{display:none}.topright .paper{display:none}.layout{grid-template-columns:1fr;gap:13px}.leftcol,.rightcol{gap:13px}.hero{grid-template-columns:1fr 1fr;gap:15px;padding:18px}.heroMain{grid-column:1/-1;display:grid;grid-template-columns:1fr 110px;align-items:center}.heroMain .label{grid-column:1/-1;margin-bottom:6px}.heroValue{font-size:38px}.heroUsd{font-size:12px}.spark{height:55px;margin:0}.metric{padding-left:12px}.metric:nth-of-type(3){border-left:1px solid #15415a}.metric b{font-size:18px}.metric small{font-size:10px}.metric:last-child{display:block}.sectionhead{padding:15px 14px 11px}.positions{padding:0 7px 8px;gap:9px}.poshead{gap:7px;padding:12px 11px 7px}.coin{width:34px;height:34px;font-size:16px}.symbol{font-size:14px}.tag,.timeframe{font-size:9px;padding:6px 6px}.status{font-size:9px;padding:6px}.posmain{grid-template-columns:minmax(0,1fr) minmax(118px,.8fr);gap:9px;padding:8px 12px 13px}.pnl{font-size:clamp(30px,8vw,39px)}.usd{font-size:12px}.prices{padding-left:11px;gap:10px}.price{font-size:11px}.price b{font-size:11px}.levels{gap:6px;padding:0 11px 12px}.level{font-size:10px;padding:7px 8px}.age{font-size:10px}.panel{border-radius:16px}.panelhead{padding:15px 14px 0}.marketrow{font-size:11px}.footer{padding-top:17px;font-size:9px}}
+@media(max-width:390px){.poshead{gap:5px}.coin{width:30px;height:30px}.symbol{font-size:12px}.tag,.timeframe{padding:5px;font-size:8px}.status{padding:5px;font-size:8px}.posmain{grid-template-columns:minmax(0,1fr) minmax(108px,.8fr)}.pnl{font-size:29px}.level{font-size:9px;padding:6px}.age{font-size:9px}.heroValue{font-size:34px}}
+</style></head><body><div class="app">
+<aside class="sidebar"><div class="brand"><div class="logo">J</div><div class="brandname">JustInApps<small>Trading Bot</small></div></div>
+<nav class="nav"><a class="active" href="#overview"><span class="navicon">⌂</span>Dashboard</a><a href="#positions"><span class="navicon">▣</span>Positions</a><a href="#stats"><span class="navicon">◷</span>Trade Snapshot</a><a href="#settings"><span class="navicon">⚙</span>Settings</a></nav>
+<div class="paperbox"><span class="paper"><i class="dot"></i> PAPER TRADING</span><p>No real funds · Demo mode<br>Positions are read-only.</p></div>
+<div class="livebox"><span class="liveicon">◴</span><div><b>Live Data</b><small id="sideUpdated">Connecting…</small></div><i class="live-dot"></i></div></aside>
+<main class="content" id="overview"><header class="topbar"><div class="greeting"><h1>Good evening, Trader <span aria-hidden="true">👋</span></h1><p>Stay disciplined. Let the strategy work.</p></div><div class="topright"><div class="clock" id="clock">LIVE SNAPSHOT · UTC+8</div><button class="bell" aria-label="Live status">♧</button><span class="paper"><i class="dot"></i> PAPER TRADING</span></div></header>
+<div class="layout"><div class="leftcol"><section class="panel hero"><div class="heroMain"><div class="label">PORTFOLIO PNL (NET)</div><div><div id="net" class="heroValue green">—</div><div id="netUsd" class="heroUsd green">Live estimate</div></div><svg class="spark" viewBox="0 0 170 58" preserveAspectRatio="none" aria-label="Current PNL sparkline"><defs><linearGradient id="sparkFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#00e6b2" stop-opacity=".28"/><stop offset="1" stop-color="#00e6b2" stop-opacity="0"/></linearGradient></defs><path d="M0 48 L12 39 L23 43 L34 27 L45 35 L55 24 L67 31 L78 19 L88 29 L99 15 L110 24 L120 13 L130 22 L142 9 L152 15 L170 2 L170 58 L0 58Z" fill="url(#sparkFill)"/><path d="M0 48 L12 39 L23 43 L34 27 L45 35 L55 24 L67 31 L78 19 L88 29 L99 15 L110 24 L120 13 L130 22 L142 9 L152 15 L170 2" fill="none" stroke="#00e6b2" stroke-width="2"/></svg></div><div class="metric"><div class="label">Gross PNL</div><b id="gross" class="green">—</b><small>Before estimated costs</small></div><div class="metric"><div class="label">Avg Net</div><b id="avg" class="green">—</b><small>Per open position</small></div><div class="metric"><div class="label">Active Positions</div><b id="count">—</b><small>Currently followed</small></div></section>
+<section class="panel" id="positions"><div class="sectionhead"><h2>⌖ &nbsp; Active Positions <span id="countTitle">(—)</span></h2><span class="viewall">LIVE · READ ONLY</span></div><div id="cards" class="positions"><div class="empty">Loading live positions…</div></div></section>
+<section class="panel" id="stats"><div class="sectionhead"><h2>▥ &nbsp; Portfolio Snapshot</h2><span class="panelhint">CURRENT OPEN POSITIONS</span></div><div style="padding:0 18px 17px;display:grid;grid-template-columns:1fr auto;gap:12px;align-items:center"><div><div class="label">Portfolio PNL (Net)</div><div id="netBottom" class="heroValue green">—</div></div><div style="border-left:1px solid #16415a;padding-left:20px"><div class="label">Active Positions</div><div id="countBottom" style="font-size:27px;font-weight:850;margin-top:6px">—</div></div></div></section></div>
+<div class="rightcol"><section class="panel rightpanel"><div class="panelhead"><span class="paneltitle">▧ &nbsp; Market Overview</span><span class="panelhint">FOLLOWED PAIRS</span></div><div id="marketList" class="marketlist"><div class="empty">Waiting for live prices…</div></div></section>
+<section class="panel chartpanel"><div class="panelhead"><span class="paneltitle">♧ &nbsp; Position PNL</span><span class="charttools"><span class="active">LIVE</span></span></div><div class="chartwrap"><svg id="pnlChart" class="chartsvg" viewBox="0 0 360 190" role="img" aria-label="Current PNL by position"><defs><linearGradient id="chartFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#00e6b2" stop-opacity=".25"/><stop offset="1" stop-color="#00e6b2" stop-opacity="0"/></linearGradient></defs><g stroke="#123047" stroke-width="1"><path d="M35 25H350 M35 65H350 M35 105H350 M35 145H350"/><path d="M35 20V155 M115 20V155 M195 20V155 M275 20V155 M350 20V155"/></g><g fill="#83a8c6" font-size="10"><text x="2" y="28">+3%</text><text x="2" y="68">+1%</text><text x="10" y="108">0%</text><text x="2" y="148">-2%</text></g><path id="chartArea" d="M35 105 L80 90 L125 115 L170 60 L215 75 L260 45 L305 68 L350 35 L350 155 L35 155Z" fill="url(#chartFill)"/><path id="chartLine" d="M35 105 L80 90 L125 115 L170 60 L215 75 L260 45 L305 68 L350 35" fill="none" stroke="#00e6b2" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg><div class="chartlegend"><span>Loss ←</span><span>Net PNL per position</span><span>→ Profit</span></div></div></section>
+<section class="panel rightpanel"><div class="panelhead"><span class="paneltitle">▥ &nbsp; Trading Stats</span><span class="panelhint">LIVE SNAPSHOT</span></div><div class="statsgrid"><div class="statbox"><span>Open Positions</span><b id="statOpen">—</b></div><div class="statbox"><span>Profitable Now</span><b id="statGreen" class="green">—</b></div><div class="statbox"><span>Best Open PNL</span><b id="statBest" class="green">—</b></div><div class="statbox"><span>Worst Open PNL</span><b id="statWorst" class="red">—</b></div></div></section>
+<section class="panel rightpanel" id="settings"><div class="panelhead"><span class="paneltitle">◉ &nbsp; Data & Privacy</span></div><div style="padding:12px 17px 17px;color:#91b5d3;font-size:11px;line-height:1.65">This dashboard shows followed paper-trading positions only. PNL is an estimate after configured costs. No real orders are placed.</div></section></div></div>
+<footer class="footer"><span><strong>◈ JustInApps</strong> · Trading Bot</span><span class="footright">ϟ Smarter Trading · Better Results</span></footer></main></div>
+<script>
+const token=location.pathname.split('/').filter(Boolean).pop();const fmt=(v,d=4)=>Number(v).toLocaleString('en-US',{maximumFractionDigits:d});const pct=v=>(Number(v)>=0?'+':'')+Number(v).toFixed(2)+'%';
+function el(tag,cls,txt){const n=document.createElement(tag);if(cls)n.className=cls;if(txt!==undefined)n.textContent=txt;return n}
+function setTone(node,v){node.className=node.className.replace(/\bgreen\b|\bred\b/g,'').trim()+' '+(Number(v)>=0?'green':'red')}
+function drawPositionChart(positions){const line=document.getElementById('chartLine'),area=document.getElementById('chartArea');if(!positions.length){line.setAttribute('d','M35 105H350');area.setAttribute('d','M35 105H350V155H35Z');line.setAttribute('stroke','#6485a0');return}const vals=positions.map(p=>Number(p.net)||0),max=Math.max(1,...vals.map(Math.abs));const pts=vals.map((v,i)=>{const x=35+(315*(i/(Math.max(1,vals.length-1))));const y=105-(v/max)*65;return [x,y]});if(pts.length===1)pts.push([350,pts[0][1]]);const d=pts.map((p,i)=>(i?'L':'M')+p[0]+' '+p[1]).join(' ');line.setAttribute('d',d);line.setAttribute('stroke',vals.reduce((a,b)=>a+b,0)>=0?'#00e6b2':'#ff496e');area.setAttribute('d',d+' L350 155 L35 155Z');area.setAttribute('fill',vals.reduce((a,b)=>a+b,0)>=0?'url(#chartFill)':'#ff496e18')}
+async function load(){try{const r=await fetch('/api/dashboard/'+encodeURIComponent(token),{cache:'no-store'});if(!r.ok)throw Error('HTTP '+r.status);const d=await r.json();for(const id of ['net','netBottom']){const n=document.getElementById(id);n.textContent=pct(d.net);setTone(n,d.net)}document.getElementById('netUsd').textContent='Live estimate · after costs';const gross=document.getElementById('gross');gross.textContent=pct(d.gross);setTone(gross,d.gross);const avg=document.getElementById('avg');avg.textContent=pct(d.avg);setTone(avg,d.avg);const count=String(d.positions.length).padStart(2,'0');['count','countBottom','statOpen'].forEach(id=>document.getElementById(id).textContent=count);document.getElementById('countTitle').textContent='('+count+')';const now=new Date();document.getElementById('clock').textContent=now.toLocaleString('en-GB',{weekday:'short',day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false,timeZone:'Asia/Brunei'})+' (UTC+8)';document.getElementById('sideUpdated').textContent='Updated '+now.toLocaleTimeString('en-GB',{timeZone:'Asia/Brunei'});document.getElementById('updated')?.replaceChildren();const cards=document.getElementById('cards');cards.replaceChildren();if(!d.positions.length)cards.append(el('div','empty','Belum ada posisi aktif. Ikuti sinyal dari Discord untuk melihat posisi di dashboard ini.'));for(const p of d.positions){const card=el('article','position');const head=el('div','poshead');const symbol=p.symbol||'UNKNOWN';const icon=el('div','coin '+(symbol.includes('ETH')||symbol.includes('SUI')?'alt':''),symbol.includes('BTC')?'₿':symbol.includes('ETH')?'◆':symbol.includes('SOL')?'◎':symbol.replace('USDT','').slice(0,1));head.append(icon,el('div','symbol',symbol),el('span','tag '+(p.side==='SHORT'?'short':''),p.side));head.append(el('span','timeframe','· '+p.timeframe+'m'));head.append(el('div','spacer'),el('span','status','OPEN'));card.append(head);const main=el('div','posmain');const left=el('div','');left.append(el('div','pnl '+(p.net>=0?'green':'red'),pct(p.net)),el('div','usd muted','Net PNL · after costs'));const prices=el('div','prices');for(const [label,value] of [['Entry',p.entry],['Last',p.last]]){const row=el('div','price');row.append(el('span','',label),el('b','',fmt(value,8)));prices.append(row)}main.append(left,prices);card.append(main);const levels=el('div','levels');levels.append(el('div','level','◉ SL  '+fmt(p.sl,8)),el('div','level tp','♧ TP  '+fmt(p.tp,8)),el('div','age','◷ '+p.age));card.append(levels);cards.append(card)}const market=document.getElementById('marketList');market.replaceChildren();if(!d.positions.length)market.append(el('div','empty','No followed pairs'));for(const p of d.positions.slice(0,6)){const row=el('div','marketrow');row.append(el('div','marketcoin',p.symbol.includes('BTC')?'₿':p.symbol.includes('ETH')?'◆':p.symbol.includes('SOL')?'◎':p.symbol.slice(0,1)),el('div','marketname',p.symbol),el('div','marketprice',fmt(p.last,8)),el('div','change '+(p.net>=0?'green':'red'),pct(p.net)));market.append(row)}const profitable=d.positions.filter(p=>p.net>0);document.getElementById('statGreen').textContent=profitable.length+' / '+d.positions.length;const sorted=[...d.positions].sort((a,b)=>b.net-a.net);const best=document.getElementById('statBest'),worst=document.getElementById('statWorst');best.textContent=sorted.length?pct(sorted[0].net):'—';worst.textContent=sorted.length?pct(sorted[sorted.length-1].net):'—';setTone(best,sorted.length?sorted[0].net:0);setTone(worst,sorted.length?sorted[sorted.length-1].net:0);drawPositionChart(d.positions)}catch(e){document.getElementById('sideUpdated').textContent='Connection issue · retrying';console.error(e)}}load();setInterval(load,15000);
+</script></body></html>"""
+
+
+def _dashboard_token(user_id: int) -> str:
+    uid = str(int(user_id))
+    sig = hmac.new(DASHBOARD_SECRET.encode(), uid.encode(), hashlib.sha256).hexdigest()[:32]
+    return f"{uid}.{sig}"
+
+
+def _valid_dashboard_token(token: str) -> Optional[int]:
+    try:
+        uid, sig = token.split(".", 1)
+        expected = hmac.new(DASHBOARD_SECRET.encode(), uid.encode(), hashlib.sha256).hexdigest()[:32]
+        if not hmac.compare_digest(sig, expected):
+            return None
+        return int(uid)
+    except (ValueError, TypeError):
+        return None
+
+
+async def _dashboard_data(user_id: int):
+    if db is None or market is None:
+        raise web.HTTPServiceUnavailable(text="Trading service is not ready")
+    recs = await db.user_follows(user_id, 200)
+    opened = [r for r in recs if r.get("status") == "OPEN"][:20]
+    positions, gross_values, net_values = [], [], []
+    for rec in opened:
+        live = await live_follow_metrics(rec)
+        if not live:
+            continue
+        entry = float(rec.get("follow_price") or 0)
+        side = "LONG" if rec.get("direction") == "LONG" else "SHORT"
+        net = float(live["net_pct"])
+        gross = float(live["move_pct"])
+        net_values.append(net); gross_values.append(gross)
+        positions.append({"symbol": rec.get("symbol", "UNKNOWN"), "side": side,
+            "timeframe": str(rec.get("timeframe", "?")), "net": net, "gross": gross,
+            "entry": entry, "last": float(live["price"]),
+            "sl": float(rec.get("sl") or 0), "tp": float(rec.get("tp") or 0),
+            "age": f"{max(0, int((datetime.now(timezone.utc).timestamp()-live['age_ts'])/60))}m ago" if live.get("age_ts") else "time n/a"})
+    return {"positions": positions, "net": sum(net_values), "gross": sum(gross_values),
+            "avg": sum(net_values)/len(net_values) if net_values else 0.0}
+
+
+async def dashboard_page(request):
+    if _valid_dashboard_token(request.match_info.get("token", "")) is None:
+        raise web.HTTPForbidden(text="Invalid dashboard link")
+    return web.Response(text=DASHBOARD_HTML, content_type="text/html")
+
+
+async def dashboard_api(request):
+    user_id = _valid_dashboard_token(request.match_info.get("token", ""))
+    if user_id is None:
+        raise web.HTTPForbidden(text="Invalid dashboard link")
+    return web.json_response(await _dashboard_data(user_id), headers={"Cache-Control": "no-store"})
+
+
+async def start_dashboard_server():
+    global _dashboard_runner
+    if _dashboard_runner is not None:
+        return
+    app = web.Application()
+    app.router.add_get("/dashboard/{token}", dashboard_page)
+    app.router.add_get("/api/dashboard/{token}", dashboard_api)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", "8080"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    try:
+        await site.start()
+        _dashboard_runner = runner
+        log.info("Live dashboard web server listening on port %s", port)
+    except OSError:
+        await runner.cleanup()
+        log.exception("Tidak bisa membuka port dashboard; pastikan PORT Railway tersedia")
+
+
+def dashboard_url(user_id: int) -> Optional[str]:
+    base = DASHBOARD_BASE_URL or ("https://" + os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip().strip("/"))
+    if not base or base == "https://":
+        return None
+    return f"{base}/dashboard/{_dashboard_token(user_id)}"
 
 
 # ============================================================ helper tampilan
@@ -1100,27 +1226,46 @@ async def history(interaction: discord.Interaction):
     await interaction.followup.send("\n".join(lines), ephemeral=True)
 
 
-@bot.tree.command(name="trade", description="Lihat PnL/ROI berjalan dari trade yang kamu follow")
+@bot.tree.command(name="trade", description="Lihat PnL teks dan buka dashboard visual live")
 async def trade_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True, thinking=True)
     if db is None or market is None:
         await interaction.followup.send("Layanan belum siap, coba lagi sebentar.", ephemeral=True)
         return
-    embed, png = await build_live_trades_embed(interaction.user)
-    if png:
-        file = discord.File(io.BytesIO(png), filename="trade-dashboard.png")
-        # In image mode, keep the Discord embed as a clean caption; the PNG is the dashboard.
-        embed.clear_fields()
-        embed.title = "📊 TRADE DASHBOARD · MODERN CARD"
-        embed.description = "Live snapshot dari posisi yang kamu ikuti. Detail PNL dan level posisi ada pada kartu gambar di bawah."
-        embed.set_image(url="attachment://trade-dashboard.png")
-        await interaction.followup.send(embed=embed, file=file, ephemeral=True)
+    recs = await db.user_follows(interaction.user.id, 200)
+    opened = [r for r in recs if r.get("status") == "OPEN"][:8]
+    lines = []
+    net_values, gross_values = [], []
+    for rec in opened:
+        live = await live_follow_metrics(rec)
+        side = "LONG" if rec.get("direction") == "LONG" else "SHORT"
+        entry = float(rec.get("follow_price") or 0)
+        sl, tp = float(rec.get("sl") or 0), float(rec.get("tp") or 0)
+        age_ts = _ts(rec.get("followed_at"))
+        age = f"<t:{age_ts}:R>" if age_ts else "waktu tidak tersedia"
+        if live:
+            net, gross = live["net_pct"], live["move_pct"]
+            net_values.append(net); gross_values.append(gross)
+            pnl_icon = "🟢" if net >= 0 else "🔴"
+            lines.append(f"{pnl_icon} **{rec.get('symbol','UNKNOWN')} · {side} · {rec.get('timeframe','?')}m** — `OPEN`\n"
+                f"Net **{net:+.2f}%** · Gross **{gross:+.2f}%**\n"
+                f"Entry `{fmt_price(entry)}` → Last `{fmt_price(live['price'])}`\n"
+                f"SL `{fmt_price(sl)}` · TP `{fmt_price(tp)}` · {age}")
+        else:
+            lines.append(f"⚪ **{rec.get('symbol','UNKNOWN')} · {side} · {rec.get('timeframe','?')}m** — `OPEN`\n"
+                f"Harga live belum tersedia · Entry `{fmt_price(entry)}` · SL `{fmt_price(sl)}` · TP `{fmt_price(tp)}`")
+    net_total = sum(net_values); gross_total = sum(gross_values)
+    avg = net_total / len(net_values) if net_values else 0.0
+    message = ("**JUSTJINAPPS · TRADE SNAPSHOT**\n"
+        f"Mode: `PAPER TRADING` · Posisi aktif: **{len(opened):02d}**\n"
+        f"Portfolio Net PNL: **{net_total:+.2f}%** · Gross PNL: **{gross_total:+.2f}%** · Avg Net: **{avg:+.2f}%**\n\n"
+        + ("\n\n".join(lines) if lines else "Belum ada posisi aktif. Gunakan tombol **Ikut Trade** pada sinyal untuk mulai memantau posisi."))
+    url = dashboard_url(interaction.user.id)
+    if url:
+        message += f"\n\n🌐 **Dashboard visual live:** {url}\n_Refresh otomatis setiap 15 detik. Siapa pun yang memiliki link ini dapat melihat data posisi milikmu; jangan bagikan jika tidak ingin dibuka orang lain._"
     else:
-        # Reliable fallback: text embed retains the same live values and all existing fields.
-        await interaction.followup.send(
-            content="⚠️ Gambar dashboard gagal dibuat; menampilkan ringkasan teks.",
-            embed=embed, ephemeral=True
-        )
+        message += "\n\n⚠️ Link dashboard belum aktif. Atur `DASHBOARD_BASE_URL` ke domain publik Railway (contoh `https://nama-app.up.railway.app`) dan redeploy."
+    await interaction.followup.send(message[:1990], ephemeral=True)
 
 
 @bot.tree.command(name="riwayat", description="Riwayat trade yang kamu ikuti (Follow Trade)")
