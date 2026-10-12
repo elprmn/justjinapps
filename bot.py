@@ -243,6 +243,64 @@ def make_history_view():
     return view
 
 
+class ResetConfirmView(discord.ui.View):
+    """Two-step destructive reset; only the administrator who invoked it can confirm."""
+    def __init__(self, requester_id: int):
+        super().__init__(timeout=60)
+        self.requester_id = requester_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("Hanya admin yang memulai reset yang boleh memakai tombol ini.", ephemeral=True)
+            return False
+        if not interaction.guild or not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("Reset hanya bisa dilakukan administrator server.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="RESET SEMUA DATA", style=discord.ButtonStyle.danger, emoji="🗑️")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        for child in self.children:
+            child.disabled = True
+        try:
+            if db is None:
+                await interaction.followup.send("Reset dibatalkan: Upstash belum terhubung.", ephemeral=True)
+                return
+            deleted_keys = await db.reset_all_data()
+            deleted_messages = 0
+            channel = await get_alert_channel()
+            if channel is not None and hasattr(channel, "history"):
+                try:
+                    async for message in channel.history(limit=None, oldest_first=True):
+                        if bot.user and message.author.id == bot.user.id:
+                            try:
+                                await message.delete()
+                                deleted_messages += 1
+                            except discord.NotFound:
+                                pass
+                            except discord.Forbidden:
+                                log.warning("Tidak punya izin menghapus pesan bot di channel alert")
+                                break
+                except (discord.Forbidden, discord.HTTPException) as exc:
+                    log.warning("Gagal membersihkan pesan Discord bot: %s", exc)
+            await interaction.edit_original_response(content=(
+                "✅ **Reset selesai.**\n"
+                f"• Key Upstash dalam namespace `{db.prefix}:*` dihapus: **{deleted_keys}**\n"
+                f"• Pesan milik bot yang dihapus dari channel alert: **{deleted_messages}**\n"
+                "Token, Environment Variables, konfigurasi Railway, dan pesan pengguna tidak dihapus."
+            ), view=self)
+        except Exception as exc:
+            log.exception("Reset command gagal")
+            await interaction.followup.send(f"❌ Reset gagal atau mungkin hanya selesai sebagian: `{str(exc)[:250]}`. Periksa log Railway dan Upstash sebelum mencoba lagi.", ephemeral=True)
+
+    @discord.ui.button(label="Batal", style=discord.ButtonStyle.secondary, emoji="✖️")
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content="Reset dibatalkan. Tidak ada data yang dihapus.", view=self)
+
+
 def make_view(sid, closed=False):
     view = discord.ui.View(timeout=None)
     view.add_item(FollowButton(sid, disabled=closed, label="Selesai" if closed else "Ikut Trade"))
@@ -745,6 +803,29 @@ async def alert_diagnostics():
         lines.append("Scan terakhir: belum ada")
     lines.append(f"Masalah terakhir: {scan_state['error'] or '— tidak ada'}")
     return "\n".join(lines)
+
+
+@bot.tree.command(name="reset", description="Reset data bot di Upstash dan hapus pesan alert milik bot")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def reset(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Command ini hanya untuk administrator server.", ephemeral=True)
+        return
+    embed = discord.Embed(
+        title="⚠️ Konfirmasi Reset Total Bot",
+        description=(
+            "Tindakan ini **tidak bisa dibatalkan**. Jika dikonfirmasi:\n\n"
+            f"• Semua key Redis dengan prefix `{db.prefix if db else 'bybit_signal_bot'}:*` akan dihapus.\n"
+            "• Pesan yang dikirim bot di channel alert akan dihapus.\n"
+            "• History, Follow Trade, sinyal, dan data dedupe bot akan hilang.\n\n"
+            "**Tidak** menghapus pesan pengguna, channel/server Discord, token, atau Environment Variables."
+        ),
+        color=discord.Color.red(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_footer(text="Hanya administrator yang memulai command dapat mengonfirmasi · tombol kedaluwarsa 60 detik")
+    await interaction.response.send_message(embed=embed, view=ResetConfirmView(interaction.user.id), ephemeral=True)
 
 
 @bot.tree.command(name="status", description="Cek status bot, konfigurasi dan market data")

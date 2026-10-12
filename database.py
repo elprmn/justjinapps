@@ -66,6 +66,11 @@ class UpstashRedisREST:
 
     async def _cmd(self, *args): return (await self.execute_pipeline([[str(a) for a in args]]))[0]
     async def ping(self): return await self._cmd("PING")
+    async def scan(self, cursor=0, match=None, count=100):
+        args = ["SCAN", cursor]
+        if match is not None: args += ["MATCH", match]
+        if count: args += ["COUNT", int(count)]
+        return await self._cmd(*args)
     async def get(self, key): return await self._cmd("GET", key)
     async def exists(self, key): return int(await self._cmd("EXISTS", key) or 0)
     async def incr(self, key): return int(await self._cmd("INCR", key))
@@ -109,6 +114,27 @@ class Database:
         await self.redis.connect()
 
     def key(self, suffix): return f"{self.prefix}:{suffix}"
+
+    async def reset_all_data(self):
+        """Delete every Redis key in this bot's namespace only; never FLUSHDB/FLUSHALL."""
+        if not self.redis:
+            raise RuntimeError("Upstash belum terhubung")
+        cursor = "0"
+        deleted = 0
+        pattern = f"{self.prefix}:*"
+        while True:
+            result = await self.redis.scan(cursor, match=pattern, count=100)
+            if not isinstance(result, list) or len(result) != 2:
+                raise RuntimeError("Respons SCAN Upstash tidak valid")
+            cursor, keys = str(result[0]), result[1] or []
+            # Delete in small batches to avoid REST URL/payload limits.
+            for start in range(0, len(keys), 50):
+                batch = keys[start:start + 50]
+                if batch:
+                    deleted += int(await self.redis.delete(*batch) or 0)
+            if cursor == "0":
+                break
+        return deleted
 
     # ------------------------------------------------------------------ sinyal
     async def add_signal(self, s, cooldown_minutes):
