@@ -46,7 +46,7 @@ Embed SIGNAL kini 3 baris deskripsi (Entry/SL/TP · RR/skor/fee/spread · alasan
 ## Deploy (Railway + Upstash Redis)
 1. Buat database di Upstash Console (Redis), lalu buka menu **REST API** dan salin REST URL serta REST token.
 2. Push folder ini ke GitHub dan deploy service bot di Railway. Pada Variables bot, isi `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN`, `DISCORD_TOKEN`, `GUILD_ID`, `ALERT_CHANNEL_ID` (+ opsional lainnya dari `.env.example`). Jangan gunakan `REDIS_URL` dari service Redis Railway untuk versi ini.
-3. Start command `python bot.py` (Procfile: `worker: python bot.py`). **Satu replica** saja.
+3. Start command `python bot.py` (Procfile: `web: python bot.py`). **Satu replica** saja.
 4. Izin bot di channel alert: View Channel, Send Messages, Embed Links, **Attach Files**, **Read Message History** (untuk update pesan sinyal dan reply hasil). Scope invite: `bot` + `applications.commands`.
 5. Di Upstash, pilih kebijakan persistensi/retensi yang sesuai dan pantau kuota request. Jangan menghapus database saat bot menyimpan riwayat follow.
 6. Start konservatif: `MAX_SCAN_SYMBOLS=15`, `SCAN_INTERVAL_SECONDS=120`, `SCAN_TIMEFRAMES=5,15`.

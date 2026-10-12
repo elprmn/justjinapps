@@ -25,6 +25,7 @@ ALERT_CHANNEL_ID = os.getenv("ALERT_CHANNEL_ID", "").strip().strip("\"\'").strip
 DASHBOARD_BASE_URL = os.getenv("DASHBOARD_BASE_URL", "").strip().rstrip("/")
 DASHBOARD_SECRET = os.getenv("DASHBOARD_SECRET", "").strip() or os.getenv("DISCORD_TOKEN", "")
 _dashboard_runner = None
+bot_state = {"discord": "starting"}
 SCAN_INTERVAL_SECONDS = max(60, int(os.getenv("SCAN_INTERVAL_SECONDS", "120")))
 MAX_SCAN_SYMBOLS = max(5, min(60, int(os.getenv("MAX_SCAN_SYMBOLS", "25"))))
 MIN_SIGNAL_SCORE = max(50, min(100, int(os.getenv("MIN_SIGNAL_SCORE", "70"))))
@@ -197,6 +198,17 @@ async def _dashboard_data(user_id: int):
             "avg": sum(net_values)/len(net_values) if net_values else 0.0}
 
 
+async def dashboard_home(request):
+    # Root domain health/landing page. Personal live data is only exposed by
+    # the signed /dashboard/{token} route linked from Discord /trade.
+    html = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#07111f"><title>JustJinApps · Trading Dashboard</title><style>*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:radial-gradient(ellipse at top,#102c42 0,#07111f 58%);color:#e7f4ff;font:16px Inter,system-ui,sans-serif;padding:24px}.card{max-width:650px;width:100%;padding:clamp(24px,6vw,48px);border:1px solid #1a6571;border-radius:28px;background:linear-gradient(145deg,#102538dd,#0a1726e8);box-shadow:0 24px 80px #0006}.tag{display:inline-block;color:#54e9df;border:1px solid #1b7781;border-radius:999px;padding:7px 12px;font-size:12px;letter-spacing:.12em}h1{font-size:clamp(28px,6vw,44px);margin:20px 0 12px}p{color:#a9bed0;line-height:1.7}.hint{margin-top:28px;padding:16px;border-radius:16px;background:#07111f;border:1px solid #21374a;color:#d8e9f5}.brand{color:#51e6c2;font-weight:700;letter-spacing:.08em;font-size:13px}</style></head><body><main class="card"><div class="brand">JUSTJINAPPS / TRADING</div><div style="margin-top:24px"><span class="tag">PAPER TRADING · READ ONLY</span></div><h1>Live Trading Dashboard</h1><p>Web dashboard server is online. Untuk menjaga privasi, data posisi pribadi tidak ditampilkan di halaman umum ini.</p><div class="hint">Buka Discord dan jalankan <strong>/trade</strong>, lalu gunakan tautan dashboard personal yang dikirim oleh bot.</div></main></body></html>"""
+    return web.Response(text=html, content_type="text/html", headers={"Cache-Control": "no-store"})
+
+
+async def favicon_empty(request):
+    return web.Response(status=204)
+
+
 async def dashboard_page(request):
     if _valid_dashboard_token(request.match_info.get("token", "")) is None:
         raise web.HTTPForbidden(text="Invalid dashboard link")
@@ -210,11 +222,42 @@ async def dashboard_api(request):
     return web.json_response(await _dashboard_data(user_id), headers={"Cache-Control": "no-store"})
 
 
+NOT_FOUND_TEXT = "404 - halaman tidak ada. Buka / untuk status server, atau pakai tautan dashboard dari Discord /trade."
+
+
+@web.middleware
+async def error_pages(request, handler):
+    """404 yang jelas (bukan halaman kosong) dan tidak pernah membocorkan traceback."""
+    try:
+        return await handler(request)
+    except web.HTTPNotFound:
+        if request.path.startswith("/api/"):
+            return web.json_response({"error": "not_found"}, status=404, headers={"Cache-Control": "no-store"})
+        return web.Response(text=NOT_FOUND_TEXT, status=404, headers={"Cache-Control": "no-store"})
+
+
+async def health(request):
+    """Cek cepat dari browser/Railway: server web hidup, dan status bot Discord/Redis/Bybit."""
+    return web.json_response({
+        "ok": True,
+        "discord": bot_state["discord"],
+        "bot_ready": bot.is_ready(),
+        "market": market is not None,
+        "database": db is not None,
+    }, headers={"Cache-Control": "no-store"})
+
+
 async def start_dashboard_server():
+    """Idempotent. Dipanggil dari main() SEBELUM login Discord, supaya URL Railway selalu hidup."""
     global _dashboard_runner
     if _dashboard_runner is not None:
         return
-    app = web.Application()
+    app = web.Application(middlewares=[web.normalize_path_middleware(append_slash=False, remove_slash=True), error_pages])
+    app.router.add_get("/", dashboard_home)
+    app.router.add_get("/dashboard", dashboard_home)  # tanpa token -> landing, bukan 404
+    app.router.add_get("/health", health)
+    app.router.add_get("/healthz", health)
+    app.router.add_get("/favicon.ico", favicon_empty)
     app.router.add_get("/dashboard/{token}", dashboard_page)
     app.router.add_get("/api/dashboard/{token}", dashboard_api)
     runner = web.AppRunner(app)
@@ -224,10 +267,10 @@ async def start_dashboard_server():
     try:
         await site.start()
         _dashboard_runner = runner
-        log.info("Live dashboard web server listening on port %s", port)
+        log.info("Live dashboard web server listening on 0.0.0.0:%s (routes: / /dashboard /health /dashboard/{token})", port)
     except OSError:
         await runner.cleanup()
-        log.exception("Tidak bisa membuka port dashboard; pastikan PORT Railway tersedia")
+        log.exception("Tidak bisa membuka port dashboard %s; pastikan PORT Railway tersedia", port)
 
 
 def dashboard_url(user_id: int) -> Optional[str]:
@@ -1009,7 +1052,11 @@ def _missing_perms(channel):
 @tasks.loop(seconds=60)
 async def scheduled_scan():
     if not market or not db:
-        await start_services()
+        try:
+            await start_services()
+        except Exception:
+            log.exception("start_services gagal; dicoba lagi di scan berikutnya")
+            return
     problem = _alert_problem()
     if problem:
         scan_state.update(at=datetime.now(timezone.utc), error=problem)
@@ -1081,6 +1128,7 @@ async def before_scheduled_scan():
 
 @bot.event
 async def on_ready():
+    bot_state["discord"] = "ready"
     log.info("Login sebagai %s", bot.user)
 
 
@@ -1315,8 +1363,17 @@ async def realtime_cmd(interaction: discord.Interaction):
 
 
 async def main():
+    await start_dashboard_server()  # web hidup dulu: URL Railway tidak 404 walau Discord/Redis/Bybit bermasalah
     async with bot:
-        await bot.start(DISCORD_TOKEN)
+        bot_state["discord"] = "connecting"
+        try:
+            await bot.start(DISCORD_TOKEN)
+        except discord.LoginFailure:
+            bot_state["discord"] = "login_failed"
+            log.error("Login Discord GAGAL: DISCORD_TOKEN salah/di-reset. Perbaiki variable di Railway lalu redeploy. "
+                      "Web tetap hidup; cek /health.")
+            await asyncio.Event().wait()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
