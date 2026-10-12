@@ -14,8 +14,8 @@ from market import BybitMarket, analyze_symbol, fmt_price, INTERVALS
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("signalbot")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
-GUILD_ID = os.getenv("GUILD_ID", "").strip()
-ALERT_CHANNEL_ID = os.getenv("ALERT_CHANNEL_ID", "").strip()
+GUILD_ID = os.getenv("GUILD_ID", "").strip().strip("\"\'").strip()
+ALERT_CHANNEL_ID = os.getenv("ALERT_CHANNEL_ID", "").strip().strip("\"\'").strip()
 SCAN_INTERVAL_SECONDS = max(60, int(os.getenv("SCAN_INTERVAL_SECONDS", "120")))
 MAX_SCAN_SYMBOLS = max(5, min(60, int(os.getenv("MAX_SCAN_SYMBOLS", "25"))))
 MIN_SIGNAL_SCORE = max(50, min(100, int(os.getenv("MIN_SIGNAL_SCORE", "75"))))
@@ -29,17 +29,76 @@ if not SCAN_TIMEFRAMES:
     SCAN_TIMEFRAMES = ("5", "15", "30")
 
 intents = discord.Intents.default()
-bot = commands.Bot(command_prefix="!", intents=intents)
 market: Optional[BybitMarket] = None
 db: Optional[Database] = None
 scan_lock = asyncio.Lock()
 
 
+class SignalBot(commands.Bot):
+    async def setup_hook(self):
+        # Slash command DISYNC PERTAMA, sebelum Redis/Bybit, supaya kegagalan
+        # layanan lain tidak membuat command hilang dari Discord.
+        await sync_commands()
+        await start_services()
+        if not scheduled_scan.is_running():
+            scheduled_scan.change_interval(seconds=SCAN_INTERVAL_SECONDS)
+            scheduled_scan.start()
+
+    async def close(self):
+        if scheduled_scan.is_running():
+            scheduled_scan.cancel()
+        if market:
+            await market.close()
+        if db:
+            await db.close()
+        await super().close()
+
+
+bot = SignalBot(command_prefix="!", intents=intents)
+
+
+async def sync_commands():
+    if GUILD_ID and not GUILD_ID.isdigit():
+        log.warning("GUILD_ID tidak valid (%r); harus angka ID server. Memakai sync global.", GUILD_ID)
+    if GUILD_ID.isdigit():
+        try:
+            guild = discord.Object(id=int(GUILD_ID))
+            bot.tree.copy_global_to(guild=guild)
+            synced = await bot.tree.sync(guild=guild)
+            log.info("Slash command tersinkron ke guild %s: %s", GUILD_ID, ", ".join(c.name for c in synced))
+            return
+        except discord.Forbidden:
+            log.error("Sync ke guild %s ditolak (Missing Access). Pastikan bot ada di server tsb dan di-invite dengan "
+                      "scope 'applications.commands'. Mencoba sync global...", GUILD_ID)
+        except Exception:
+            log.exception("Gagal sync ke guild %s, mencoba sync global...", GUILD_ID)
+    try:
+        synced = await bot.tree.sync()
+        log.info("Slash command tersinkron global: %s (bisa butuh beberapa menit untuk muncul)", ", ".join(c.name for c in synced))
+    except Exception:
+        log.exception("Gagal sync slash commands")
+
+
 async def init_db():
     global db
-    db = Database()
-    await db.connect()
+    candidate = Database()
+    await candidate.connect()  # jika gagal, db tetap None (tidak setengah terhubung)
+    db = candidate
     log.info("Redis signal store connected")
+
+
+async def start_services():
+    """Idempotent: aman dipanggil berulang; dicoba lagi oleh scheduled_scan bila sebelumnya gagal."""
+    global market
+    if market is None:
+        m = BybitMarket()
+        await m.start()
+        market = m
+    if db is None:
+        try:
+            await init_db()
+        except Exception:
+            log.exception("Redis belum terhubung (cek REDIS_URL / reference variable Railway). Akan dicoba lagi.")
 
 
 async def store_signal(s):
@@ -146,7 +205,9 @@ async def evaluate_open_signals():
 @tasks.loop(seconds=60)
 async def scheduled_scan():
     if not market or not db:
-        return
+        await start_services()
+        if not market or not db:
+            return
     try:
         results = await scan_once()
         await evaluate_open_signals()
@@ -171,22 +232,24 @@ async def before_scheduled_scan():
 
 @bot.event
 async def on_ready():
-    global market
     log.info("Login sebagai %s", bot.user)
-    if market is None:
-        market = BybitMarket(); await market.start()
-    if db is None:
-        await init_db()
+
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    original = getattr(error, "original", error)
+    log.error("Slash command /%s error: %r", getattr(interaction.command, "name", "?"), original, exc_info=original)
+    if isinstance(original, AttributeError) and (market is None or db is None):
+        msg = "Layanan (Redis/market data) belum siap. Cek Deploy Logs Railway, lalu coba lagi."
+    else:
+        msg = f"Terjadi error: {original}"
     try:
-        if GUILD_ID.isdigit():
-            guild = discord.Object(id=int(GUILD_ID))
-            bot.tree.copy_global_to(guild=guild); await bot.tree.sync(guild=guild)
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
         else:
-            await bot.tree.sync()
-    except Exception:
-        log.exception("Gagal sync slash commands")
-    if not scheduled_scan.is_running():
-        scheduled_scan.change_interval(seconds=SCAN_INTERVAL_SECONDS); scheduled_scan.start()
+            await interaction.response.send_message(msg, ephemeral=True)
+    except discord.HTTPException:
+        pass
 
 
 @bot.tree.command(name="status", description="Cek status bot, konfigurasi dan market data")
@@ -290,12 +353,6 @@ async def realtime_cmd(interaction: discord.Interaction):
         "Analisis sinyal tetap memakai candle tertutup dari REST agar level entry/SL/TP tidak dihitung dari candle berjalan.",
         ephemeral=True
     )
-
-
-@bot.event
-async def on_close():
-    if market:
-        await market.close()
 
 
 async def main():

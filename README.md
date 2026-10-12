@@ -32,7 +32,7 @@ Discord slash-command bot for Bybit linear USDT perpetual public market data. It
 1. Deploy this folder as a **background worker/service**, not a static site.
 2. Start command: `python bot.py` (Procfile included).
 3. Add environment variables from `.env.example`.
-4. Attach persistent storage and set `DATABASE_PATH` to its path, e.g. `/data/signals.db`.
+4. Riwayat sinyal disimpan di Redis (`REDIS_URL`), bukan file lokal. Lihat bagian Railway di bawah.
 5. Start conservatively: `MAX_SCAN_SYMBOLS=15`, `SCAN_INTERVAL_SECONDS=120`, `SCAN_TIMEFRAMES=5,15,30`.
 6. Check logs for `Login sebagai ...`; run `/status`, `/market BTCUSDT`, `/signal BTCUSDT` selecting a timeframe, then `/scanner`.
 
@@ -72,3 +72,16 @@ Discord slash-command bot for Bybit linear USDT perpetual public market data. It
 - Jika koneksi WebSocket terputus, bot mencoba menyambung kembali dan REST tetap tersedia sebagai fallback.
 - Gunakan satu instance bot untuk menghindari scanner berjalan ganda. Slash commands mungkin memerlukan waktu untuk muncul jika tidak mengisi `GUILD_ID`.
 - Sinyal, skor, TP/SL, dan statistik bersifat informasional/edukasi, bukan jaminan profit atau nasihat keuangan.
+
+### Troubleshooting
+
+**Slash command (/scanner dll.) tidak muncul**
+- Log harus menampilkan `Slash command tersinkron ...: status, signal, scanner, ...`. Jika tidak ada, lihat error di baris sebelumnya.
+- `Missing Access` / `Forbidden`: bot belum di-invite dengan scope **`applications.commands`** (selain `bot`) atau tidak ada di server `GUILD_ID`. Invite ulang lewat Developer Portal → OAuth2 → URL Generator.
+- `GUILD_ID` harus angka ID server (tanpa tanda kutip). Jika kosong/salah, command didaftarkan global dan bisa lambat muncul.
+- Setelah deploy, restart Discord (Ctrl+R / tutup-buka app) agar daftar command ter-refresh.
+
+**`403 Forbidden` dari api.bybit.com**
+- Bybit memblokir IP/region tertentu (termasuk banyak IP datacenter AS). Pindahkan service ke region **Singapore (Southeast Asia)** di Railway → Service → Settings → Deploy → Region, lalu redeploy.
+- Bot otomatis mencoba host cadangan `api.bytick.com`. Host bisa diganti dengan `BYBIT_REST_URLS` (pisah koma) dan `BYBIT_WS_URL` (opsional).
+- Saat diblok, bot memakai backoff (5s → maks 300s) sehingga tidak membanjiri API.

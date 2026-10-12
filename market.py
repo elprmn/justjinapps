@@ -1,4 +1,5 @@
 import asyncio
+import os
 import time
 import json
 import logging
@@ -10,7 +11,20 @@ import pandas as pd
 
 log = logging.getLogger("signalbot.market")
 
-BASE_URL = "https://api.bybit.com"
+# Host REST Bybit. Jika host pertama diblok (HTTP 403/451) bot otomatis mencoba host berikutnya.
+# Bisa diganti lewat env BYBIT_REST_URLS (pisahkan dengan koma).
+REST_HOSTS = [h.strip().rstrip("/") for h in os.getenv(
+    "BYBIT_REST_URLS", "https://api.bybit.com,https://api.bytick.com").split(",") if h.strip()]
+if not REST_HOSTS:
+    REST_HOSTS = ["https://api.bybit.com"]
+# Opsional: paksa URL WebSocket tertentu. Kosong = diturunkan dari host REST yang sedang berhasil.
+WS_URL_OVERRIDE = os.getenv("BYBIT_WS_URL", "").strip()
+BLOCKED_STATUSES = (403, 451)
+REQUEST_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; signalbot/1.0)", "Accept": "application/json"}
+
+
+class BybitBlockedError(RuntimeError):
+    """Bybit menolak request karena IP/region server (HTTP 403/451)."""
 # Strictly limited to short-term timeframes requested by the user.
 INTERVALS = {"5": "5", "15": "15", "30": "30"}
 
@@ -32,11 +46,12 @@ class BybitMarket:
         self.ws_connected = False
         self.ws_last_message = None
         self.ws_task = None
+        self.host_idx = 0
 
     async def start(self):
         timeout = aiohttp.ClientTimeout(total=15, connect=8)
         connector = aiohttp.TCPConnector(limit=16, ttl_dns_cache=300)
-        self.session = aiohttp.ClientSession(timeout=timeout, connector=connector)
+        self.session = aiohttp.ClientSession(timeout=timeout, connector=connector, headers=REQUEST_HEADERS)
         self.ws_task = asyncio.create_task(self._ticker_stream_loop(), name="bybit-ticker-websocket")
 
     async def close(self):
@@ -55,12 +70,26 @@ class BybitMarket:
     async def get_json(self, path, params=None):
         if self.session is None:
             raise RuntimeError("Market client belum aktif")
+        n = len(REST_HOSTS)
+        blocked = []
+        payload = None
         async with self.sem:
-            async with self.session.get(BASE_URL + path, params=params) as resp:
-                if resp.status == 429:
-                    raise RuntimeError("Bybit rate limit; kurangi MAX_SCAN_SYMBOLS atau interval scan")
-                resp.raise_for_status()
-                payload = await resp.json()
+            for offset in range(n):
+                host = REST_HOSTS[(self.host_idx + offset) % n]
+                async with self.session.get(host + path, params=params) as resp:
+                    if resp.status in BLOCKED_STATUSES:
+                        blocked.append(f"{host} -> HTTP {resp.status}")
+                        continue
+                    if resp.status == 429:
+                        raise RuntimeError("Bybit rate limit; kurangi MAX_SCAN_SYMBOLS atau interval scan")
+                    resp.raise_for_status()
+                    payload = await resp.json(content_type=None)
+                self.host_idx = (self.host_idx + offset) % n  # ingat host yang berhasil
+                break
+        if payload is None:
+            raise BybitBlockedError(
+                "Bybit menolak akses dari IP/region server ini (" + "; ".join(blocked) + "). "
+                "Di Railway pindahkan region service ke Singapore (Southeast Asia) lalu redeploy.")
         if payload.get("retCode") != 0:
             raise RuntimeError(f"Bybit API error: {payload.get('retMsg')}")
         return payload.get("result", {})
@@ -79,9 +108,21 @@ class BybitMarket:
             raise ValueError("Pair tidak ditemukan pada kategori linear.")
         return rows[0]
 
+    def _ws_url(self):
+        if WS_URL_OVERRIDE:
+            return WS_URL_OVERRIDE
+        host = REST_HOSTS[self.host_idx % len(REST_HOSTS)]
+        return host.replace("https://api.", "wss://stream.", 1) + "/v5/public/linear"
+
+    async def _ws_ping(self, ws):
+        """Bybit mewajibkan ping JSON {"op":"ping"} setiap ~20 detik."""
+        while True:
+            await asyncio.sleep(20)
+            await ws.send_json({"op": "ping"})
+
     async def _ticker_stream_loop(self):
         """Subscribe to live Bybit ticker updates; REST remains the fallback."""
-        ws_url = "wss://stream.bybit.com/v5/public/linear"
+        backoff = 5
         while True:
             try:
                 # Refresh the universe on reconnect so newly liquid pairs are picked up.
@@ -98,36 +139,45 @@ class BybitMarket:
                 if not symbols:
                     await asyncio.sleep(15)
                     continue
-                async with self.session.ws_connect(ws_url, heartbeat=20, receive_timeout=45) as ws:
+                async with self.session.ws_connect(self._ws_url(), receive_timeout=45) as ws:
+                    backoff = 5
                     self.ws_connected = True
                     for start in range(0, len(symbols), 40):
                         await ws.send_json({"op": "subscribe", "args": [f"tickers.{sym}" for sym in symbols[start:start + 40]]})
-                    last_ping = time.monotonic()
-                    async for msg in ws:
-                        if msg.type == aiohttp.WSMsgType.TEXT:
-                            payload = json.loads(msg.data)
-                            topic = payload.get("topic", "")
-                            data = payload.get("data")
-                            if topic.startswith("tickers.") and isinstance(data, dict):
-                                symbol = topic.split(".", 1)[1]
-                                old = self.ticker_cache.get(symbol, {})
-                                merged = {**old, **data, "_received_at": time.time()}
-                                self.ticker_cache[symbol] = merged
-                                self.ws_last_message = time.time()
-                            elif payload.get("op") == "ping":
-                                await ws.send_json({"op": "pong"})
-                        elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
-                            break
+                    ping_task = asyncio.create_task(self._ws_ping(ws))
+                    try:
+                        async for msg in ws:
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                payload = json.loads(msg.data)
+                                topic = payload.get("topic", "")
+                                data = payload.get("data")
+                                if topic.startswith("tickers.") and isinstance(data, dict):
+                                    symbol = topic.split(".", 1)[1]
+                                    old = self.ticker_cache.get(symbol, {})
+                                    merged = {**old, **data, "_received_at": time.time()}
+                                    self.ticker_cache[symbol] = merged
+                                    self.ws_last_message = time.time()
+                            elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE,
+                                              aiohttp.WSMsgType.CLOSING, aiohttp.WSMsgType.CLOSED):
+                                break
+                    finally:
+                        ping_task.cancel()
                 self.ws_connected = False
                 # Refresh subscriptions regularly, not continuously reconnecting.
                 await asyncio.sleep(30)
             except asyncio.CancelledError:
                 self.ws_connected = False
                 raise
+            except BybitBlockedError as exc:
+                self.ws_connected = False
+                log.warning("Bybit memblokir akses; coba lagi %ss: %s", backoff, exc)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 300)
             except Exception as exc:
                 self.ws_connected = False
-                log.warning("Bybit WebSocket disconnected; retry in 5s: %s", exc)
-                await asyncio.sleep(5)
+                log.warning("Feed ticker Bybit gagal/terputus; coba lagi %ss: %s", backoff, exc)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 120)
 
     def realtime_status(self):
         age = int(time.time() - self.ws_last_message) if self.ws_last_message else None
