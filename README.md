@@ -1,24 +1,26 @@
-# Bybit USDT Perpetual Discord Signal Bot — v4 (Trend Pullback + Follow Trade)
+# Bybit USDT Perpetual Discord Signal Bot — v4 (Adaptive Scalping + Follow Trade)
 
 Bot sinyal Discord untuk Bybit linear USDT perpetual (data publik, **tanpa API key, tanpa eksekusi order**).
 Ini scanner eksperimental, **bukan strategi yang terbukti profit**. Jalankan paper/follow dulu dan baca `/performance`.
 
-## Metode: Trend Pullback (TF entry 5m/15m, filter 15m/30m)
-Syarat **wajib** untuk SIGNAL (LONG; SHORT kebalikannya):
-1. **Tren 30m:** close > EMA200, EMA20 > EMA50, close > EMA50, dan **ADX ≥ 20** (bukan sideways).
-2. **15m searah:** EMA20 > EMA50. TF entry: EMA20 > EMA50.
-3. **Pullback:** dalam 8 candle terakhir harga menyentuh EMA20 tanpa close di bawah EMA50; sentuhan terjadi di 2 candle terakhir.
-4. **Trigger:** candle close kembali di atas EMA20, searah, dengan **rejection wick (≥40% range) atau engulfing**, volume ≥ rata-rata, RSI naik dari area pullback.
-5. **Anti-chase:** close tidak boleh > 1,5×ATR dari EMA20.
-6. **Filter BTC:** untuk altcoin, arah yang melawan gerakan BTC 15m (> 1,5 ATR dalam 3 candle) diblok.
-7. **Fee:** setup ditolak jika fee pulang-pergi memakan > 0,25R (SL terlalu sempit). Akibatnya BTC/ETH di 5m sering tidak lolos; itu disengaja.
-8. **News:** isi `NEWS_BLACKOUTS` (UTC) agar tidak ada sinyal ±30 menit dari rilis besar.
+## Metode: Adaptive Scalping (entry 5m/15m, regime filter 30m)
 
-SL = di luar swing pullback + 0,2×ATR (min 0,8×ATR, maks 2,5×ATR). TP = `TP_R` × risiko (default **1R**).
-**WATCH** = tren valid dan pullback sedang berlangsung, belum ada candle konfirmasi (tidak masuk statistik, tidak bisa di-follow).
-Skor 0-100 hanya untuk **peringkat**, bukan probabilitas menang.
+Default `SIGNAL_STRATEGY=adaptive` memilih metode sesuai kondisi pasar 30m:
+- **Tren kuat** (ADX ≥ `REGIME_TREND_ADX`, arah EMA/close sejalan): Breakout + Retest dan EMA Pullback + VWAP.
+- **Range** (ADX ≤ `REGIME_RANGE_ADX`): Bollinger Bands + RSI, Liquidity Sweep + Reversal, dan MACD Divergence.
+- **Transisi**: jika `ACTIVE_FILTER=1`, bot mengevaluasi kelima metode; jika `0`, hanya Breakout + Retest dan BB + RSI.
 
-Breakeven winrate (setelah fee): dengan TP 1R dan fee ≈0,13R, perlu winrate ≈ 56% hanya untuk impas. Verifikasi lewat `/performance` dan `/riwayat` sebelum percaya.
+Metode yang tersedia: `breakout_retest`, `bb_rsi`, `both`, `all`, `adaptive`. `MIN_SIGNAL_SCORE=65` pada `.env.example` merupakan setelan lebih aktif; naikkan jika terlalu banyak sinyal. Skor 0–100 adalah ranking heuristik, **bukan probabilitas menang**.
+
+- **Breakout + Retest:** breakout rentang lalu retest dan close kembali mempertahankan level, dengan filter volume, tren 15m/30m, BTC, likuiditas, dan biaya.
+- **Bollinger Bands + RSI:** candle tertutup sebelumnya keluar band lalu candle terbaru kembali masuk, RSI berbalik, dan ADX 30m tidak terlalu tinggi.
+- **EMA Pullback + VWAP:** tren 15m/30m, pullback EMA20, close searah VWAP dan candle konfirmasi.
+- **MACD + Divergence:** swing harga membuat extreme baru sementara MACD histogram tidak mengonfirmasi, lalu candle reversal menutup searah.
+- **Liquidity Sweep + Reversal:** harga menyapu swing high/low sebelumnya lalu menutup kembali ke dalam rentang.
+
+## Biaya dan hasil simulasi
+
+Net R mengurangi estimasi fee round-trip (`FEE_PCT`), spread saat sinyal, slippage round-trip (`SLIPPAGE_PCT`) dan funding jika sisi posisi diperkirakan membayar (`FUNDING_ESTIMATE=1`). Funding dihitung sebagai estimasi konservatif satu event, bukan data funding aktual berdasarkan waktu posisi; biaya sebenarnya dapat berbeda. Setup ditolak jika estimasi biaya terlalu besar relatif terhadap risiko (`MAX_FEE_R`). Tidak ada klaim profitabilitas: tes sintaks/smoke test bukan backtest historis. Lakukan backtest dengan data Bybit historis, biaya realistis, lalu out-of-sample sebelum mengambil keputusan.
 
 ## Follow Trade
 - Tiap pesan **SIGNAL** punya tombol **✅ Ikut Trade** dan **📋 Riwayat Saya**.
@@ -34,7 +36,7 @@ Breakeven winrate (setelah fee): dengan TP 1R dan fee ≈0,13R, perlu winrate �
 
 ## Evaluator
 - Memakai high/low candle tertutup. TP dan SL di candle yang sama = `AMBIGUOUS`, **dihitung -1R** (konservatif).
-- R dilaporkan **gross dan net** (dikurangi `FEE_PCT`). Slippage/funding belum dimodelkan.
+- R dilaporkan gross dan net setelah estimasi fee, spread, slippage (`SLIPPAGE_PCT`), serta funding sisi pembayar bila `FUNDING_ESTIMATE=1`. Funding hanya estimasi konservatif satu event; holding time dan funding timestamp aktual tidak disimulasikan. Hasil tetap paper trading, bukan backtest atau jaminan profit.
 - `/performance`: winrate konservatif = TP/(TP+SL+Ambigu), plus ringkasan per timeframe.
 
 ## Embed
@@ -59,7 +61,7 @@ Embed SIGNAL kini 3 baris deskripsi (Entry/SL/TP · RR/skor/fee/spread · alasan
 
 ## Strategi Scalping (paper trading)
 
-Hanya strategi yang diminta pengguna yang tersedia: `breakout_retest` dan `bb_rsi`. Default `.env.example` adalah `SIGNAL_STRATEGY=both` agar kedua strategi yang diminta aktif. Gunakan `breakout_retest` atau `bb_rsi` bila ingin menjalankan satu strategi saja. Timeframe entry tetap `5,15` dengan filter kondisi tren/ADX 30m.
+Strategi default adalah `SIGNAL_STRATEGY=adaptive`: pada tren kuat memakai Breakout + Retest, EMA Pullback + VWAP, dan MACD Divergence; pada range memakai Bollinger Bands + RSI, Liquidity Sweep + Reversal, dan MACD Divergence; di kondisi transisi mengevaluasi kelima metode. Opsi manual: `breakout_retest`, `bb_rsi`, `both`, atau `all`. Timeframe entry tetap `5,15` dengan filter rezim 30m.
 
 - **Breakout + Retest:** menunggu breakout range, retest level, candle searah, volume minimum, konfirmasi 15m dan tren 30m, serta filter likuiditas/BTC/biaya.
 - **Bollinger + RSI:** menunggu candle sebelumnya keluar dari band lalu candle tertutup kembali masuk, RSI berbalik dari area ekstrem, candle konfirmasi, dan ADX 30m tidak terlalu tinggi. Target dibatasi oleh BB midline dan `TP_R`.

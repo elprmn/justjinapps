@@ -132,8 +132,10 @@ class Database:
                   "direction": s["direction"], "score": int(s["score"]), "entry": float(s["entry"]),
                   "stop_loss": float(s["sl"]), "take_profit": float(s["tp"]), "rr": float(s.get("rr") or 0),
                   "status": "OPEN", "outcome": None, "closed_at": None, "candle_start": s.get("candle_start"),
-                  "strategy": s.get("strategy", "PULLBACK"), "spread_pct": s.get("spread_pct"), "funding_pct": s.get("funding_pct"),
-                  "close_price": None, "result_r": None, "net_r": None, "fee_r": None,
+                  "strategy": s.get("strategy", "PULLBACK"), "regime": s.get("regime"), "spread_pct": s.get("spread_pct"),
+                  "fee_cost_pct": s.get("fee_cost_pct"), "slippage_pct": s.get("slippage_pct"),
+                  "funding_pct": s.get("funding_pct"), "funding_cost_pct": s.get("funding_cost_pct"),
+                  "total_cost_pct": s.get("total_cost_pct"), "close_price": None, "result_r": None, "net_r": None, "fee_r": None,
                   "channel_id": None, "message_id": None}
         async with self.redis.pipeline(transaction=True) as p:
             p.set(self.key(f"signal:{sid}"), json.dumps(record, separators=(",", ":")))
@@ -211,7 +213,10 @@ class Database:
                "followed_at": now.isoformat(), "follow_price": float(follow_price),
                "symbol": signal["symbol"], "timeframe": signal["timeframe"], "direction": signal["direction"],
                "signal_entry": signal["entry"], "sl": signal["stop_loss"], "tp": signal["take_profit"],
-               "strategy": signal.get("strategy", "PULLBACK"), "spread_pct": signal.get("spread_pct", 0.0),
+               "strategy": signal.get("strategy", "PULLBACK"), "regime": signal.get("regime"),
+               "spread_pct": signal.get("spread_pct", 0.0), "fee_cost_pct": signal.get("fee_cost_pct"),
+               "slippage_pct": signal.get("slippage_pct"), "funding_pct": signal.get("funding_pct"),
+               "funding_cost_pct": signal.get("funding_cost_pct"), "total_cost_pct": signal.get("total_cost_pct"),
                "status": "OPEN", "result_r": None, "net_r": None, "close_price": None, "closed_at": None}
         ok = await self.redis.set(self.key(f"follow:{sid}:{user_id}"), json.dumps(rec, separators=(",", ":")), nx=True)
         if not ok: return None

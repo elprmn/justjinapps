@@ -10,7 +10,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from market import BybitMarket, analyze_symbol, fmt_price, INTERVALS, FEE_PCT, MAX_SPREAD_PCT, SIGNAL_STRATEGY
+from market import BybitMarket, analyze_symbol, fmt_price, INTERVALS, FEE_PCT, SLIPPAGE_PCT, MAX_SPREAD_PCT, SIGNAL_STRATEGY
 from chart import render_chart, CHART_ENABLED
 
 logging.basicConfig(level=logging.INFO)
@@ -332,7 +332,7 @@ async def build_history_embed(user, mode="all"):
             f' · Avg **{avg_net:+.2f}R** · PF **{pf_text}** · Berjalan **{len(open_)}**')
     desc = head + "\n\n" + ("\n".join(lines) if lines else "_Belum ada trade. Tekan **Ikut Trade** pada sinyal baru._")
     embed = discord.Embed(title=f"📋 Riwayat Follow · {user.display_name}", description=desc[:4000], color=discord.Color.blurple())
-    embed.set_footer(text=f"Net = estimasi fee {FEE_PCT:g}% + spread saat sinyal. Simulasi, bukan order nyata. Menampilkan {len(shown)} terbaru.")
+    embed.set_footer(text=f"Net = estimasi fee + spread + slippage + funding (jika diperkirakan membayar). Simulasi, bukan order nyata. Menampilkan {len(shown)} terbaru.")
     return embed
 
 
@@ -352,7 +352,7 @@ async def settle_follows(sig, outcome, close_price, closed_at):
         gross = ((exit_price - fp) if long else (fp - exit_price)) / risk
         risk_pct = risk / fp * 100 if fp else 0.0
         # Estimasi round-trip: fee taker + spread saat sinyal. Bukan simulasi slippage sempurna.
-        cost_pct = FEE_PCT + float(sig.get("spread_pct") or 0.0)
+        cost_pct = float(sig.get("total_cost_pct") if sig.get("total_cost_pct") is not None else (FEE_PCT + float(sig.get("spread_pct") or 0.0) + SLIPPAGE_PCT))
         fee_r = cost_pct / risk_pct if risk_pct else 0.0
         rec = await db.update_follow(sid, f["user_id"], status=outcome, result_r=gross, fee_r=fee_r, net_r=gross - fee_r,
                                      close_price=close_price, closed_at=closed_at)
@@ -430,7 +430,7 @@ async def scan_once(limit=MAX_SCAN_SYMBOLS):
                 s["tier"] = tier
                 results.append(s)
         results.sort(key=lambda s: (s["tier"] == "SIGNAL", s["score"], s.get("turnover24h", 0)), reverse=True)
-        log.info("Scan: %d kandidat likuid, %d setup tren+pullback, skor tertinggi=%s, SIGNAL=%d, WATCH=%d",
+        log.info("Scan: %d kandidat likuid, %d setup strategi adaptif, skor tertinggi=%s, SIGNAL=%d, WATCH=%d",
                  len(candidates), len(found), max((s["score"] for s in found), default="-"),
                  sum(s["tier"] == "SIGNAL" for s in results), sum(s["tier"] == "WATCH" for s in results))
         return results
@@ -463,7 +463,7 @@ def signal_result_r(sig, outcome, close_price):
     else:
         gross = ((close_price - entry) if long else (entry - close_price)) / risk
     risk_pct = risk / entry * 100
-    cost_pct = FEE_PCT + float(sig.get("spread_pct") or 0.0)
+    cost_pct = float(sig.get("total_cost_pct") if sig.get("total_cost_pct") is not None else (FEE_PCT + float(sig.get("spread_pct") or 0.0) + SLIPPAGE_PCT))
     fee_r = cost_pct / risk_pct if risk_pct else 0.0
     return gross, fee_r, gross - fee_r
 
@@ -666,9 +666,9 @@ async def status(interaction: discord.Interaction):
     try:
         tickers = await market.get_tickers()
         await interaction.followup.send(
-            f"✅ Bot aktif · Pair linear: **{len(tickers)}** · Metode: **Trend Pullback**\n"
+            f"✅ Bot aktif · Pair linear: **{len(tickers)}** · Metode: **Adaptive Scalping**\n"
             f"TF: **{', '.join(SCAN_TIMEFRAMES)}m** · Scan tiap **{SCAN_INTERVAL_SECONDS}s** · Max pair **{MAX_SCAN_SYMBOLS}**\n"
-            f"Skor SIGNAL ≥ **{MIN_SIGNAL_SCORE}** · WATCH ≥ **{MIN_WATCH_SCORE}** · Fee diasumsikan **{FEE_PCT:g}%** pulang-pergi\n"
+            f"Skor SIGNAL ≥ **{MIN_SIGNAL_SCORE}** · WATCH ≥ **{MIN_WATCH_SCORE}** · Metode **{SIGNAL_STRATEGY.upper()}** · Fee **{FEE_PCT:g}%** + slippage **{SLIPPAGE_PCT:g}%**\n"
             "Data: Bybit public API · Mode: sinyal + follow simulasi, tanpa eksekusi order.\n"
             + await alert_diagnostics(), ephemeral=True)
     except Exception as e:
@@ -705,9 +705,9 @@ async def scanner(interaction: discord.Interaction, jumlah: app_commands.Range[i
     try:
         results = await scan_once()
         if not results:
-            await interaction.followup.send(f"Tidak ada setup tren+pullback dengan skor ≥ {MIN_WATCH_SCORE}. **NO TRADE**."); return
+            await interaction.followup.send(f"Tidak ada setup strategi aktif dengan skor ≥ {MIN_WATCH_SCORE}. **NO TRADE**."); return
         top = results[:jumlah]
-        embed = discord.Embed(title="🔎 Scanner · Trend Pullback", description="\n".join(_line(s, True) for s in top),
+        embed = discord.Embed(title="🔎 Scanner · Adaptive Scalping", description="\n".join(_line(s, True) for s in top),
                               color=discord.Color.blurple(), timestamp=datetime.now(timezone.utc))
         embed.set_footer(text="Level = referensi, bukan jaminan fill. Skor bukan probabilitas." + (" Chart = setup teratas." if CHART_ENABLED else ""))
         await interaction.followup.send(**await chart_kwargs(top[0], embed))

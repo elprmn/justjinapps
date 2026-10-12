@@ -37,23 +37,29 @@ def _env_float(name, default):
         return float(default)
 
 
-# ---------------- Konfigurasi metode Trend Pullback ----------------
+# ---------------- Konfigurasi Adaptive Scalping ----------------
 TP_R = max(0.5, _env_float("TP_R", 1.5))                  # target awal momentum; wajib diuji dengan backtest
 ADX_MIN = _env_float("ADX_MIN", 20)                       # ADX 30m minimal (filter sideways)
 PULLBACK_LOOKBACK = int(_env_float("PULLBACK_LOOKBACK", 8))  # candle terakhir yang dicek untuk pullback
 MAX_EXTENDED_ATR = _env_float("MAX_EXTENDED_ATR", 1.5)    # anti-chase: maks jarak close dari EMA20 (x ATR)
 SL_BUFFER_ATR = 0.2                                       # buffer SL di luar swing pullback
 SL_ATR_MIN, SL_ATR_MAX = 0.8, 2.5                         # batas jarak SL (x ATR)
-FEE_PCT = _env_float("FEE_PCT", 0.11)                     # fee pulang-pergi (%), taker 0.055% x 2
+FEE_PCT = _env_float("FEE_PCT", 0.11)                     # fee pulang-pergi (%)
+SLIPPAGE_PCT = max(0.0, _env_float("SLIPPAGE_PCT", 0.04)) # estimasi slippage round-trip (%)
+FUNDING_ESTIMATE = os.getenv("FUNDING_ESTIMATE", "1").strip().lower() not in ("0", "false", "no", "off")
 MAX_FEE_R = _env_float("MAX_FEE_R", 0.25)                 # tolak setup jika fee > X R (SL terlalu sempit)
 MAX_SPREAD_PCT = _env_float("MAX_SPREAD_PCT", 0.10)
 BTC_FILTER = os.getenv("BTC_FILTER", "1").strip().lower() not in ("0", "false", "no", "off")
 BTC_DUMP_ATR = _env_float("BTC_DUMP_ATR", 1.5)            # BTC 15m gerak > X ATR dalam 3 candle => blok arah berlawanan
 NEWS_WINDOW_MIN = int(_env_float("NEWS_WINDOW_MIN", 30))
 # Only the two user-selected strategies are enabled.
-SIGNAL_STRATEGY = os.getenv("SIGNAL_STRATEGY", "both").strip().lower()
-if SIGNAL_STRATEGY not in ("breakout_retest", "bb_rsi", "both"):
-    SIGNAL_STRATEGY = "breakout_retest"
+SIGNAL_STRATEGY = os.getenv("SIGNAL_STRATEGY", "adaptive").strip().lower()
+if SIGNAL_STRATEGY not in ("breakout_retest", "bb_rsi", "both", "adaptive", "all"):
+    SIGNAL_STRATEGY = "adaptive"
+ACTIVE_FILTER = os.getenv("ACTIVE_FILTER", "1").strip().lower() not in ("0", "false", "no", "off")
+REGIME_TREND_ADX = _env_float("REGIME_TREND_ADX", 23)
+REGIME_RANGE_ADX = _env_float("REGIME_RANGE_ADX", 20)
+SWING_LOOKBACK = max(6, int(_env_float("SWING_LOOKBACK", 12)))
 BREAKOUT_LOOKBACK = max(8, int(_env_float("BREAKOUT_LOOKBACK", 20)))
 BREAKOUT_RETEST_BARS = max(1, min(4, int(_env_float("BREAKOUT_RETEST_BARS", 3))))
 BREAKOUT_MIN_VOLUME = max(0.8, _env_float("BREAKOUT_MIN_VOLUME", 1.1))
@@ -337,6 +343,15 @@ def add_indicators(df):
     bb_std = close.rolling(20).std(ddof=0)
     df["bb_upper"] = df["bb_mid"] + 2.0 * bb_std
     df["bb_lower"] = df["bb_mid"] - 2.0 * bb_std
+    # MACD (12,26,9) and rolling VWAP; rolling window is appropriate for 24/7 crypto.
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    df["macd"] = ema12 - ema26
+    df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
+    df["macd_hist"] = df["macd"] - df["macd_signal"]
+    typical = (df["high"] + df["low"] + close) / 3.0
+    vol_sum = df["volume"].rolling(24).sum().replace(0, np.nan)
+    df["vwap"] = (typical * df["volume"]).rolling(24).sum() / vol_sum
     return df
 
 
@@ -656,8 +671,124 @@ def _bb_rsi_setup(direction, df, m15, m30, price, atr, btc_move, is_btc, diag):
             "btc_aligned": btc_aligned, "confirm15": True, "strategy": "BB_RSI"}
 
 
+def _strategy_reject(direction, diag, reason):
+    if diag is not None:
+        diag.setdefault("reasons", []).append(f"{direction}: {reason}")
+    return None
+
+
+def _risk_levels(direction, price, atr, swing_low, swing_high, rr=None):
+    long = direction == "LONG"
+    sl = float(swing_low - 0.15 * atr) if long else float(swing_high + 0.15 * atr)
+    risk = price - sl if long else sl - price
+    if risk <= 0 or risk < 0.45 * atr or risk > SL_ATR_MAX * atr:
+        return None
+    risk_pct = risk / price * 100 if price else 0.0
+    fee_r = (FEE_PCT + SLIPPAGE_PCT) / risk_pct if risk_pct else 999.0
+    if fee_r > MAX_FEE_R:
+        return None
+    r = float(rr or TP_R)
+    tp = price + (1 if long else -1) * r * risk
+    return sl, tp, risk, risk_pct, fee_r, r
+
+
+def _ema_vwap_setup(direction, df, m15, m30, price, atr, btc_move, is_btc, diag):
+    """Trend continuation after EMA20 pullback, confirmed by rolling VWAP and candle close."""
+    long = direction == "LONG"; e, p = df.iloc[-1], df.iloc[-2]
+    adx30 = float(m30["adx"]) if pd.notna(m30["adx"]) else 0.0
+    trend30 = (m30["close"] > m30["ema200"] and m30["ema20"] > m30["ema50"]) if long else (m30["close"] < m30["ema200"] and m30["ema20"] < m30["ema50"])
+    trend15 = (m15["ema20"] > m15["ema50"]) if long else (m15["ema20"] < m15["ema50"])
+    if not trend30 or not trend15 or adx30 < max(15, REGIME_RANGE_ADX):
+        return _strategy_reject(direction, diag, "EMA/VWAP perlu tren 15m/30m searah")
+    if pd.isna(e["vwap"]) or pd.isna(e["ema20"]):
+        return _strategy_reject(direction, diag, "data VWAP belum cukup")
+    touched = (float(p["low"]) <= float(p["ema20"]) * 1.002 and float(e["close"]) > float(e["ema20"])) if long else (float(p["high"]) >= float(p["ema20"]) * .998 and float(e["close"]) < float(e["ema20"]))
+    vwap_ok = float(e["close"]) >= float(e["vwap"]) if long else float(e["close"]) <= float(e["vwap"])
+    candle_ok = float(e["close"]) > float(e["open"]) if long else float(e["close"]) < float(e["open"])
+    if not (touched and vwap_ok and candle_ok):
+        return _strategy_reject(direction, diag, "belum ada pullback EMA20 + konfirmasi VWAP")
+    if not is_btc and btc_move is not None and ((long and btc_move <= -BTC_DUMP_ATR) or (not long and btc_move >= BTC_DUMP_ATR)):
+        return _strategy_reject(direction, diag, "gerak BTC kuat melawan setup")
+    sw = df.iloc[-8:]
+    levels = _risk_levels(direction, price, atr, float(sw["low"].min()), float(sw["high"].max()), TP_R)
+    if not levels: return _strategy_reject(direction, diag, "risiko/biaya EMA pullback tidak valid")
+    sl,tp,risk,risk_pct,fee_r,rr=levels
+    score = min(92, 68 + min(10, max(0, adx30-REGIME_RANGE_ADX)) + (7 if abs(price-float(e["vwap"])) <= .5*atr else 3) + (5 if float(e["volume"]) >= float(e["vol_sma20"] or 0) else 0))
+    return {"direction":direction,"stage":"TRIGGER","score":int(score),"sl":sl,"tp":tp,"rr":rr,"risk_pct":risk_pct,"reward_pct":risk_pct*rr,"fee_r":fee_r,"adx":adx30,"vol_x":float(e["volume"] / e["vol_sma20"]) if pd.notna(e["vol_sma20"]) and e["vol_sma20"] else 0,"rsi":float(e["rsi"]),"reasons":["EMA20 pullback","VWAP searah","Tren 15m/30m"],"confirm15":True,"strategy":"EMA_PULLBACK_VWAP"}
+
+
+def _macd_divergence_setup(direction, df, m15, m30, price, atr, btc_move, is_btc, diag):
+    """Simple confirmed swing divergence: price makes a new local extreme while MACD histogram does not."""
+    long = direction == "LONG"; e = df.iloc[-1]
+    look = min(24, max(12, SWING_LOOKBACK * 2)); prior = df.iloc[-look-1:-3]
+    recent = df.iloc[-3:]
+    if len(prior) < 8 or pd.isna(e["macd_hist"]): return _strategy_reject(direction, diag, "data divergence belum cukup")
+    adx30 = float(m30["adx"]) if pd.notna(m30["adx"]) else 0.0
+    if long:
+        recent_ext = float(recent["low"].min()); prior_ext = float(prior["low"].min())
+        hist_recent = float(recent.loc[recent["low"].idxmin(), "macd_hist"]); hist_prior = float(prior.loc[prior["low"].idxmin(), "macd_hist"])
+        divergence = recent_ext < prior_ext and hist_recent > hist_prior and float(e["macd_hist"]) > float(df["macd_hist"].iloc[-2])
+        candle_ok = float(e["close"]) > float(e["open"])
+    else:
+        recent_ext = float(recent["high"].max()); prior_ext = float(prior["high"].max())
+        hist_recent = float(recent.loc[recent["high"].idxmax(), "macd_hist"]); hist_prior = float(prior.loc[prior["high"].idxmax(), "macd_hist"])
+        divergence = recent_ext > prior_ext and hist_recent < hist_prior and float(e["macd_hist"]) < float(df["macd_hist"].iloc[-2])
+        candle_ok = float(e["close"]) < float(e["open"])
+    if not divergence or not candle_ok: return _strategy_reject(direction, diag, "divergence MACD belum terkonfirmasi")
+    if not is_btc and btc_move is not None and ((long and btc_move <= -BTC_DUMP_ATR) or (not long and btc_move >= BTC_DUMP_ATR)):
+        return _strategy_reject(direction, diag, "gerak BTC kuat melawan setup")
+    sw = df.iloc[-SWING_LOOKBACK:]
+    levels = _risk_levels(direction, price, atr, float(sw["low"].min()), float(sw["high"].max()), min(TP_R, 1.25))
+    if not levels: return _strategy_reject(direction, diag, "risiko/biaya divergence tidak valid")
+    sl,tp,risk,risk_pct,fee_r,rr=levels
+    score = min(88, 66 + (8 if abs(float(e["macd_hist"])) > abs(float(df["macd_hist"].iloc[-2])) else 3) + (5 if adx30 < REGIME_TREND_ADX else 0))
+    return {"direction":direction,"stage":"TRIGGER","score":int(score),"sl":sl,"tp":tp,"rr":rr,"risk_pct":risk_pct,"reward_pct":risk_pct*rr,"fee_r":fee_r,"adx":adx30,"vol_x":float(e["volume"] / e["vol_sma20"]) if pd.notna(e["vol_sma20"]) and e["vol_sma20"] else 0,"rsi":float(e["rsi"]),"reasons":["MACD histogram divergence","Swing reversal terkonfirmasi"],"confirm15":True,"strategy":"MACD_DIVERGENCE"}
+
+
+def _liquidity_sweep_setup(direction, df, m15, m30, price, atr, btc_move, is_btc, diag):
+    """Sweep of prior swing liquidity followed by a close back inside the prior range."""
+    long = direction == "LONG"; e = df.iloc[-1]
+    prior = df.iloc[-(SWING_LOOKBACK+1):-1]
+    if len(prior) < SWING_LOOKBACK: return _strategy_reject(direction, diag, "data swing belum cukup")
+    low_level, high_level = float(prior["low"].min()), float(prior["high"].max())
+    if long:
+        trigger = float(e["low"]) < low_level and float(e["close"]) > low_level and float(e["close"]) > float(e["open"])
+    else:
+        trigger = float(e["high"]) > high_level and float(e["close"]) < high_level and float(e["close"]) < float(e["open"])
+    adx30 = float(m30["adx"]) if pd.notna(m30["adx"]) else 0.0
+    if not trigger: return _strategy_reject(direction, diag, "belum ada sweep dan close kembali ke range")
+    if adx30 > REGIME_TREND_ADX + 8:
+        return _strategy_reject(direction, diag, "tren 30m terlalu kuat untuk reversal sweep")
+    if not is_btc and btc_move is not None and ((long and btc_move <= -BTC_DUMP_ATR) or (not long and btc_move >= BTC_DUMP_ATR)):
+        return _strategy_reject(direction, diag, "gerak BTC kuat melawan setup")
+    levels = _risk_levels(direction, price, atr, float(min(e["low"], low_level)) if long else float(prior["low"].min()), float(prior["high"].max()) if long else float(max(e["high"], high_level)), min(TP_R, 1.25))
+    if not levels: return _strategy_reject(direction, diag, "risiko/biaya liquidity sweep tidak valid")
+    sl,tp,risk,risk_pct,fee_r,rr=levels
+    score = min(90, 70 + (8 if abs(float(e["close"])- (low_level if long else high_level)) <= .35*atr else 3) + (5 if adx30 <= REGIME_RANGE_ADX else 0))
+    return {"direction":direction,"stage":"TRIGGER","score":int(score),"sl":sl,"tp":tp,"rr":rr,"risk_pct":risk_pct,"reward_pct":risk_pct*rr,"fee_r":fee_r,"adx":adx30,"vol_x":float(e["volume"] / e["vol_sma20"]) if pd.notna(e["vol_sma20"]) and e["vol_sma20"] else 0,"rsi":float(e["rsi"]),"reasons":["Liquidity sweep swing","Close kembali ke range","Reversal candle"],"confirm15":True,"strategy":"LIQUIDITY_SWEEP"}
+
+
+def _select_strategy_functions(adx30, trend_up, trend_down):
+    """Return strategy functions and market regime for the configured routing policy."""
+    if SIGNAL_STRATEGY == "adaptive":
+        if adx30 >= REGIME_TREND_ADX and (trend_up or trend_down):
+            return (_breakout_retest_setup, _ema_vwap_setup), "TREND"
+        if adx30 <= REGIME_RANGE_ADX:
+            return (_bb_rsi_setup, _liquidity_sweep_setup, _macd_divergence_setup), "RANGE"
+        methods = ((_breakout_retest_setup, _bb_rsi_setup, _ema_vwap_setup, _macd_divergence_setup, _liquidity_sweep_setup)
+                   if ACTIVE_FILTER else (_breakout_retest_setup, _bb_rsi_setup))
+        return methods, "TRANSITION"
+    methods = {
+        "breakout_retest": (_breakout_retest_setup,),
+        "bb_rsi": (_bb_rsi_setup,),
+        "both": (_breakout_retest_setup, _bb_rsi_setup),
+        "all": (_breakout_retest_setup, _bb_rsi_setup, _ema_vwap_setup, _macd_divergence_setup, _liquidity_sweep_setup),
+    }.get(SIGNAL_STRATEGY, (_breakout_retest_setup, _bb_rsi_setup))
+    return methods, "MANUAL"
+
+
 async def analyze_symbol(client: BybitMarket, symbol: str, entry_tf: str = "5", ticker=None, diag=None) -> Optional[dict]:
-    """Analisis Trend Pullback. `diag` (dict, opsional) diisi alasan penolakan untuk ditampilkan ke user."""
+    """Analisis adaptive scalping. `diag` menyimpan alasan penolakan setup."""
     if entry_tf not in INTERVALS:
         raise ValueError("Timeframe hanya 5, 15, atau 30 menit.")
 
@@ -698,12 +829,11 @@ async def analyze_symbol(client: BybitMarket, symbol: str, entry_tf: str = "5", 
         except Exception as exc:
             log.warning("Filter BTC dilewati (data BTC gagal): %s", exc)
 
-    # Run only the selected strategy, or both user-approved strategies when explicitly configured.
-    strategy_fns = {
-        "breakout_retest": (_breakout_retest_setup,),
-        "bb_rsi": (_bb_rsi_setup,),
-        "both": (_breakout_retest_setup, _bb_rsi_setup),
-    }[SIGNAL_STRATEGY]
+    # Adaptive regime routing: trend continuation in strong trends, mean reversion/sweep in ranges.
+    adx30 = float(m30["adx"]) if pd.notna(m30["adx"]) else 0.0
+    trend_up = float(m30["close"]) > float(m30["ema200"]) and float(m30["ema20"]) > float(m30["ema50"])
+    trend_down = float(m30["close"]) < float(m30["ema200"]) and float(m30["ema20"]) < float(m30["ema50"])
+    strategy_fns, regime = _select_strategy_functions(adx30, trend_up, trend_down)
     cands = [c for fn in strategy_fns for c in
              (fn(d, df, m15, m30, price, atr, btc_move, is_btc, diag) for d in ("LONG", "SHORT")) if c]
     if not cands:
@@ -715,20 +845,29 @@ async def analyze_symbol(client: BybitMarket, symbol: str, entry_tf: str = "5", 
     best = max(cands, key=lambda c: (c["stage"] == "TRIGGER", c["score"]))
     # Filter ulang memakai estimasi biaya round-trip: fee taker + spread pasar.
     # Ini lebih relevan untuk optimasi net R daripada fee saja.
-    total_cost_pct = FEE_PCT + spread_pct
-    best["fee_r"] = total_cost_pct / best["risk_pct"] if best.get("risk_pct") else 999.0
-    if best["fee_r"] > MAX_FEE_R:
-        return reject(f"fee + spread memakan {best['fee_r']:.2f}R (batas {MAX_FEE_R:.2f}R)")
-
     funding = ticker.get("fundingRate")
     try:
         funding_pct = float(funding) * 100 if funding not in (None, "") else None
     except (TypeError, ValueError):
         funding_pct = None
+    # Conservative estimated costs. Funding is charged only to the side expected to pay
+    # at the next funding event; actual holding duration/funding timestamps are not simulated.
+    funding_cost_pct = 0.0
+    if FUNDING_ESTIMATE and funding_pct is not None:
+        rate = funding_pct
+        pays_funding = (best["direction"] == "LONG" and rate > 0) or (best["direction"] == "SHORT" and rate < 0)
+        if pays_funding:
+            funding_cost_pct = abs(rate)
+    total_cost_pct = FEE_PCT + spread_pct + SLIPPAGE_PCT + funding_cost_pct
+    best["fee_r"] = total_cost_pct / best["risk_pct"] if best.get("risk_pct") else 999.0
+    if best["fee_r"] > MAX_FEE_R:
+        return reject(f"biaya fee+spread+slippage+funding estimasi memakan {best['fee_r']:.2f}R")
     best.update({
         "symbol": symbol, "timeframe": entry_tf, "entry": price, "candle_start": int(df["start"].iloc[-1]),
-        "strategy": best.get("strategy", SIGNAL_STRATEGY.upper()),
-        "spread_pct": spread_pct, "turnover24h": turnover, "atr_pct": atr_pct, "funding_pct": funding_pct,
+        "strategy": best.get("strategy", SIGNAL_STRATEGY.upper()), "regime": regime,
+        "spread_pct": spread_pct, "fee_cost_pct": FEE_PCT, "slippage_pct": SLIPPAGE_PCT,
+        "funding_pct": funding_pct, "funding_cost_pct": funding_cost_pct, "total_cost_pct": total_cost_pct,
+        "turnover24h": turnover, "atr_pct": atr_pct,
         "chart_df": df.tail(150).copy(),  # dipakai chart.py; tidak disimpan ke Redis
     })
     return best
