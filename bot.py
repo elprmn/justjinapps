@@ -303,8 +303,69 @@ async def handle_follow(interaction: discord.Interaction, sid: int):
     await interaction.followup.send(
         f'✅ Ikut **#{sid} {row["symbol"]} {row["direction"]} {row["timeframe"]}m**\n'
         f'Masuk `{fmt_price(price)}` · SL `{fmt_price(sl)}` · TP `{fmt_price(tp)}`{note}\n'
-        f'Hasil dicatat otomatis saat kena TP/SL → `/riwayat`', ephemeral=True)
+        f'PnL/ROI berjalan bisa dicek lewat `/trade`; hasil akhir dicatat otomatis saat TP/SL → `/riwayat`', ephemeral=True)
     await set_message_footer(interaction.message, footer_text(sid, "⏳ Berjalan", n))
+
+
+async def live_follow_metrics(rec):
+    """Snapshot PnL/ROI harga untuk follow OPEN; ROI 1x karena leverage/modal tidak dikonfigurasi."""
+    if market is None:
+        return None
+    try:
+        ticker = await market.get_ticker(rec["symbol"])
+        price = float(ticker.get("lastPrice") or 0)
+        entry = float(rec.get("follow_price") or 0)
+        if price <= 0 or entry <= 0:
+            return None
+        move_pct = ((price - entry) / entry * 100) if rec.get("direction") == "LONG" else ((entry - price) / entry * 100)
+        cost_pct = rec.get("total_cost_pct")
+        if cost_pct is None:
+            cost_pct = (float(rec.get("fee_cost_pct") or FEE_PCT) +
+                        float(rec.get("spread_pct") or 0.0) +
+                        float(rec.get("slippage_pct") or SLIPPAGE_PCT) +
+                        float(rec.get("funding_cost_pct") or 0.0))
+        cost_pct = max(0.0, float(cost_pct or 0.0))
+        return {"price": price, "move_pct": move_pct, "net_pct": move_pct - cost_pct,
+                "cost_pct": cost_pct, "age_ts": _ts(rec.get("followed_at"))}
+    except Exception as exc:
+        log.debug("Gagal mengambil PnL berjalan %s: %s", rec.get("symbol"), exc)
+        return None
+
+
+async def build_live_trades_embed(user):
+    """Embed privat berisi PnL/ROI berjalan untuk trade yang diikuti user."""
+    recs = await db.user_follows(user.id, 200)
+    open_recs = [r for r in recs if r.get("status") == "OPEN"][:20]
+    if not open_recs:
+        embed = discord.Embed(title="📈 Trade Aktif Kamu", description="Belum ada trade yang sedang berjalan. Tekan **Ikut Trade** pada sinyal aktif untuk mulai mengikuti.", color=discord.Color.blurple())
+        embed.set_footer(text="Paper trading · PnL/ROI estimasi, bukan order atau saldo nyata.")
+        return embed
+    fields = []
+    net_values = []
+    for rec in open_recs:
+        live = await live_follow_metrics(rec)
+        side = "L" if rec.get("direction") == "LONG" else "S"
+        direction_icon = "🟢" if side == "L" else "🔴"
+        title = f'{direction_icon} {rec["symbol"]} {side} · {rec["timeframe"]}m'
+        if live:
+            pnl = live["move_pct"]
+            net = live["net_pct"]
+            net_values.append(net)
+            pnl_icon = "🟩" if pnl >= 0 else "🟥"
+            age = f'<t:{live["age_ts"]}:R>' if live["age_ts"] else "waktu tidak tersedia"
+            value = (f'{pnl_icon} **PnL harga: {pnl:+.2f}%** · **ROI estimasi (1x): {pnl:+.2f}%**\n'
+                     f'Net estimasi setelah biaya: **{net:+.2f}%**\n'
+                     f'Entry `{fmt_price(float(rec["follow_price"]))}` → Harga `{fmt_price(live["price"])}`\n'
+                     f'SL `{fmt_price(float(rec.get("sl") or 0))}` · TP `{fmt_price(float(rec.get("tp") or 0))}` · mulai {age}')
+        else:
+            value = f'⚪ Harga saat ini belum tersedia\nEntry `{fmt_price(float(rec.get("follow_price") or 0))}` · <t:{_ts(rec.get("followed_at"))}:R>'
+        fields.append((title, value[:1024]))
+    color = discord.Color.green() if net_values and sum(net_values) >= 0 else discord.Color.red() if net_values else discord.Color.blurple()
+    embed = discord.Embed(title="📈 Trade Aktif Kamu · PnL / ROI", description="Snapshot harga Bybit saat command dipanggil. Angka berubah mengikuti harga; bukan order nyata.", color=color, timestamp=datetime.now(timezone.utc))
+    for title, value in fields:
+        embed.add_field(name=title, value=value, inline=False)
+    embed.set_footer(text="ROI dihitung tanpa leverage (1x); Net = PnL harga dikurangi estimasi fee, spread, slippage, dan funding. Belum termasuk efek leverage/liquidation.")
+    return embed
 
 
 async def build_history_embed(user, mode="all"):
@@ -323,7 +384,11 @@ async def build_history_embed(user, mode="all"):
     for r in shown:
         side = r["direction"][0]
         if r["status"] == "OPEN":
-            lines.append(f'⏳ **{r["symbol"]}** {side}·{r["timeframe"]}m · #{r["signal_id"]} @ `{fmt_price(r["follow_price"])}` · <t:{_ts(r["followed_at"])}:R>')
+            live = await live_follow_metrics(r)
+            if live:
+                lines.append(f'⏳ **{r["symbol"]}** {side}·{r["timeframe"]}m · PnL **{live["move_pct"]:+.2f}%** · net est **{live["net_pct"]:+.2f}%** · #{r["signal_id"]} · <t:{_ts(r["followed_at"])}:R>')
+            else:
+                lines.append(f'⏳ **{r["symbol"]}** {side}·{r["timeframe"]}m · PnL n/a · #{r["signal_id"]} @ `{fmt_price(r["follow_price"])}` · <t:{_ts(r["followed_at"])}:R>')
         else:
             lines.append(f'{OUTCOME_ICON.get(r["status"], "")} **{r["symbol"]}** {side}·{r["timeframe"]}m · {r["status"]} · '
                          f'**{(r.get("net_r") or 0):+.2f}R net** · keluar `{fmt_price(r.get("close_price") or 0)}` · {r.get("strategy", "-")} · <t:{_ts(r["closed_at"])}:R>')
@@ -740,6 +805,15 @@ async def history(interaction: discord.Interaction):
         res = f' · {r["net_r"]:+.2f}R' if r.get("net_r") is not None else ""
         lines.append(f'{OUTCOME_ICON.get(o, "")} #{r["id"]} `{r["symbol"]}` {r["direction"][0]}·{r["timeframe"]}m · {r["score"]} · **{o}**{res}')
     await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+
+@bot.tree.command(name="trade", description="Lihat PnL/ROI berjalan dari trade yang kamu follow")
+async def trade_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    if db is None or market is None:
+        await interaction.followup.send("Layanan belum siap, coba lagi sebentar.", ephemeral=True)
+        return
+    await interaction.followup.send(embed=await build_live_trades_embed(interaction.user), ephemeral=True)
 
 
 @bot.tree.command(name="riwayat", description="Riwayat trade yang kamu ikuti (Follow Trade)")

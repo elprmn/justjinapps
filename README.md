@@ -26,12 +26,13 @@ Net R mengurangi estimasi fee round-trip (`FEE_PCT`), spread saat sinyal, slippa
 - Tiap pesan **SIGNAL** punya tombol **✅ Ikut Trade** dan **📋 Riwayat Saya**.
 - Saat ikut, bot mencatat harga pasar saat itu sebagai harga masuk. Ditolak jika harga sudah menyentuh TP/SL atau sudah ≥ `FOLLOW_MAX_DRIFT_R` (0,5R) menuju TP.
 - Saat TP/SL tersentuh, bot menghitung hasil tiap follower dari harga masuk masing-masing (gross R dan net R setelah fee), mengubah footer pesan sinyal, menonaktifkan tombol, dan me-reply dengan mention para follower.
-- `/riwayat [Semua | Berjalan | Selesai]` menampilkan WR, total net R, dan 12 trade terbaru (hanya terlihat oleh kamu).
+- `/trade` menampilkan embed privat PnL/ROI berjalan per follow, harga entry/current, estimasi net setelah biaya, SL/TP, dan lama trade (contoh: `SUIUSDT L · 15m · PnL +1.25% · 12 menit lalu`). Snapshot diperbarui saat command dipanggil. ROI ditampilkan pada asumsi 1x/tanpa leverage karena leverage/modal tidak dikonfigurasi.
+- `/riwayat [Semua | Berjalan | Selesai]` menampilkan WR, total net R, dan 12 trade terbaru (hanya terlihat oleh kamu); trade yang masih berjalan juga memuat PnL/net estimasi jika harga tersedia.
 - Tombol bersifat persisten: tetap berfungsi setelah bot restart/redeploy.
 - Ini **simulasi**, bukan order nyata.
 
 ## Perintah
-`/status` `/signal` `/scanner` `/market` `/history` `/riwayat` `/performance` `/evaluate` `/realtime`
+`/status` `/signal` `/scanner` `/market` `/history` `/trade` `/riwayat` `/performance` `/evaluate` `/realtime`
 `/signal` yang ditolak menampilkan **alasan NO TRADE**.
 
 ## Evaluator
@@ -68,4 +69,4 @@ Strategi default adalah `SIGNAL_STRATEGY=adaptive`: pada tren kuat memakai Break
 - Variabel: `BREAKOUT_LOOKBACK`, `BREAKOUT_RETEST_BARS`, `BREAKOUT_MIN_VOLUME`, `BB_RSI_OVERSOLD`, `BB_RSI_OVERBOUGHT`, `BB_MAX_ADX_30M`, `TP_R`.
 - Semua sinyal tetap simulasi/paper trading. Parameter ini belum dinyatakan optimal atau profitabel; validasi lewat backtest/out-of-sample dan `/performance`.
 
-Tombol Riwayat Saya menyediakan filter Semua/Berjalan/Selesai. Statistik personal mencakup win rate berdasarkan hasil net positif, net R setelah estimasi fee, rata-rata net R, dan profit factor. Hasil follow dihitung dari harga entry follower ke level SL/TP masing-masing sinyal. Bot tetap hanya melakukan simulasi; tidak mengirim order nyata. Uji dengan paper trading dan evaluasi sampel yang cukup sebelum mempertimbangkan trading sungguhan.
+Tombol Riwayat Saya menyediakan filter Semua/Berjalan/Selesai. Statistik personal mencakup win rate berdasarkan hasil net positif, net R setelah estimasi fee, rata-rata net R, dan profit factor. Hasil follow dihitung dari harga entry follower ke level SL/TP masing-masing sinyal. Command `/trade` mengambil snapshot harga saat dipanggil (bukan live-updating message setiap detik); PnL harga dan ROI 1x sama secara persentase sebelum biaya, sedangkan net merupakan estimasi setelah biaya. Bot tetap hanya melakukan simulasi; tidak mengirim order nyata. Uji dengan paper trading dan evaluasi sampel yang cukup sebelum mempertimbangkan trading sungguhan.
