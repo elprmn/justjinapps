@@ -42,6 +42,10 @@ TP_R = max(0.5, _env_float("TP_R", 1.5))                  # target awal momentum
 ADX_MIN = _env_float("ADX_MIN", 20)                       # ADX 30m minimal (filter sideways)
 PULLBACK_LOOKBACK = int(_env_float("PULLBACK_LOOKBACK", 8))  # candle terakhir yang dicek untuk pullback
 MAX_EXTENDED_ATR = _env_float("MAX_EXTENDED_ATR", 1.5)    # anti-chase: maks jarak close dari EMA20 (x ATR)
+MIN_SETUP_SCORE = max(0, min(100, int(_env_float("MIN_SETUP_SCORE", 75))))
+ANTI_CHASE_ENABLED = os.getenv("ANTI_CHASE_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+CHOP_FILTER_ENABLED = os.getenv("CHOP_FILTER_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+FALSE_BREAKOUT_FILTER_ENABLED = os.getenv("FALSE_BREAKOUT_FILTER_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
 SL_BUFFER_ATR = 0.2                                       # buffer SL di luar swing pullback
 SL_ATR_MIN, SL_ATR_MAX = 0.8, 2.5                         # batas jarak SL (x ATR)
 FEE_PCT = _env_float("FEE_PCT", 0.11)                     # fee pulang-pergi (%)
@@ -52,11 +56,21 @@ MAX_SPREAD_PCT = _env_float("MAX_SPREAD_PCT", 0.10)
 BTC_FILTER = os.getenv("BTC_FILTER", "1").strip().lower() not in ("0", "false", "no", "off")
 BTC_DUMP_ATR = _env_float("BTC_DUMP_ATR", 1.5)            # BTC 15m gerak > X ATR dalam 3 candle => blok arah berlawanan
 NEWS_WINDOW_MIN = int(_env_float("NEWS_WINDOW_MIN", 30))
-# Only the two user-selected strategies are enabled.
+# Supported strategy names must match the router below; invalid values fail safe to adaptive.
+SUPPORTED_STRATEGIES = {
+    "breakout_retest", "bb_rsi", "both", "adaptive", "all", "squeeze",
+    "stochrsi", "supertrend", "sr", "ema_vwap", "liquidity_sweep", "vwap_reclaim",
+}
 SIGNAL_STRATEGY = os.getenv("SIGNAL_STRATEGY", "adaptive").strip().lower()
-if SIGNAL_STRATEGY not in ("breakout_retest", "bb_rsi", "both", "adaptive", "all"):
+if SIGNAL_STRATEGY not in SUPPORTED_STRATEGIES:
+    log.warning("SIGNAL_STRATEGY=%r tidak dikenal; fallback ke adaptive", SIGNAL_STRATEGY)
     SIGNAL_STRATEGY = "adaptive"
 ACTIVE_FILTER = os.getenv("ACTIVE_FILTER", "1").strip().lower() not in ("0", "false", "no", "off")
+# Eksperimen reversal tidak dimasukkan ke routing default; aktifkan hanya setelah backtest.
+ADAPTIVE_INCLUDE_SWEEP = os.getenv("ADAPTIVE_INCLUDE_SWEEP", "0").strip().lower() in ("1", "true", "yes", "on")
+ADAPTIVE_INCLUDE_TREND_EXPERIMENTS = os.getenv("ADAPTIVE_INCLUDE_TREND_EXPERIMENTS", "0").strip().lower() in ("1", "true", "yes", "on")
+BTC_FILTER_FAIL_CLOSED = os.getenv("BTC_FILTER_FAIL_CLOSED", "1").strip().lower() not in ("0", "false", "no", "off")
+SR_HARD_BLOCK = os.getenv("SR_HARD_BLOCK", "1").strip().lower() not in ("0", "false", "no", "off")
 REGIME_TREND_ADX = _env_float("REGIME_TREND_ADX", 23)
 REGIME_RANGE_ADX = _env_float("REGIME_RANGE_ADX", 20)
 SWING_LOOKBACK = max(6, int(_env_float("SWING_LOOKBACK", 12)))
@@ -705,6 +719,7 @@ def _bb_rsi_setup(direction, df, m15, m30, price, atr, btc_move, is_btc, diag):
 def _strategy_reject(direction, diag, reason):
     if diag is not None:
         diag.setdefault("reasons", []).append(f"{direction}: {reason}")
+    log.debug("Setup rejected direction=%s reason=%s", direction, reason)
     return None
 
 
@@ -746,6 +761,38 @@ def _ema_vwap_setup(direction, df, m15, m30, price, atr, btc_move, is_btc, diag)
     sl,tp,risk,risk_pct,fee_r,rr=levels
     score = min(92, 68 + min(10, max(0, adx30-REGIME_RANGE_ADX)) + (7 if abs(price-float(e["vwap"])) <= .5*atr else 3) + (5 if float(e["volume"]) >= float(e["vol_sma20"] or 0) else 0))
     return {"direction":direction,"stage":"TRIGGER","score":int(score),"sl":sl,"tp":tp,"rr":rr,"risk_pct":risk_pct,"reward_pct":risk_pct*rr,"fee_r":fee_r,"adx":adx30,"vol_x":float(e["volume"] / e["vol_sma20"]) if pd.notna(e["vol_sma20"]) and e["vol_sma20"] else 0,"rsi":float(e["rsi"]),"reasons":["EMA20 pullback","VWAP searah","Tren 15m/30m"],"confirm15":True,"strategy":"EMA_PULLBACK_VWAP"}
+
+
+def _vwap_reclaim_retest_setup(direction, df, m15, m30, price, atr, btc_move, is_btc, diag):
+    """VWAP reclaim followed by a retest/hold and a closed confirmation candle."""
+    long = direction == "LONG"
+    if len(df) < 30 or pd.isna(df["vwap"].iloc[-1]):
+        return _strategy_reject(direction, diag, "data VWAP reclaim belum cukup")
+    e, p = df.iloc[-1], df.iloc[-2]
+    vwap, prev_vwap = float(e["vwap"]), float(p["vwap"]) if pd.notna(p["vwap"]) else float(e["vwap"])
+    close, op = float(e["close"]), float(e["open"])
+    # Retest candle may wick through VWAP, but must close back on the reclaimed side.
+    touched = float(e["low"]) <= vwap + 0.20 * atr if long else float(e["high"]) >= vwap - 0.20 * atr
+    held = close >= vwap + 0.05 * atr if long else close <= vwap - 0.05 * atr
+    prev_side = float(p["close"]) <= prev_vwap if long else float(p["close"]) >= prev_vwap
+    candle_ok = close > op and close >= float(e["low"]) + 0.60 * max(1e-12, float(e["high"])-float(e["low"])) if long else close < op and close <= float(e["low"]) + 0.40 * max(1e-12, float(e["high"])-float(e["low"]))
+    # Prefer the retest to occur within the latest two completed candles.
+    if not (prev_side and touched and held and candle_ok):
+        return _strategy_reject(direction, diag, "belum ada reclaim VWAP lalu retest/hold dengan candle close kuat")
+    adx30 = float(m30["adx"]) if pd.notna(m30["adx"]) else 0.0
+    trend15 = float(m15["ema20"]) > float(m15["ema50"]) if long else float(m15["ema20"]) < float(m15["ema50"])
+    trend30 = float(m30["close"]) > float(m30["ema50"]) if long else float(m30["close"]) < float(m30["ema50"])
+    if not (trend15 and trend30):
+        return _strategy_reject(direction, diag, "VWAP reclaim berlawanan arah tren 15m/30m")
+    if not is_btc and btc_move is not None and ((long and btc_move <= -BTC_DUMP_ATR) or (not long and btc_move >= BTC_DUMP_ATR)):
+        return _strategy_reject(direction, diag, "gerak BTC kuat melawan VWAP reclaim")
+    sw = df.iloc[-7:]
+    levels = _risk_levels(direction, price, atr, float(sw["low"].min()), float(sw["high"].max()), TP_R)
+    if not levels: return _strategy_reject(direction, diag, "risiko/biaya VWAP reclaim tidak valid")
+    sl,tp,risk,risk_pct,fee_r,rr=levels
+    vol_x = float(e["volume"] / e["vol_sma20"]) if pd.notna(e["vol_sma20"]) and e["vol_sma20"] > 0 else 0.0
+    score = min(94, 66 + (8 if adx30 >= REGIME_RANGE_ADX else 2) + (6 if vol_x >= 1.2 else 2) + (5 if abs(close-vwap) <= .35*atr else 2))
+    return {"direction":direction,"stage":"TRIGGER","score":int(score),"sl":sl,"tp":tp,"rr":rr,"risk_pct":risk_pct,"reward_pct":risk_pct*rr,"fee_r":fee_r,"adx":adx30,"vol_x":vol_x,"rsi":float(e["rsi"]),"reasons":["VWAP reclaim","Retest/hold VWAP","Candle close terkonfirmasi",f"Volume {vol_x:.1f}x"],"confirm15":True,"strategy":"VWAP_RECLAIM_RETEST"}
 
 
 def _cluster_levels(df, atr, lookback, htf=False, k=3):
@@ -807,7 +854,9 @@ def _sr_confluence(c, df, price, atr):
             [lv for lv in levels if (tp + 0.1 * atr < lv["price"] < price - 0.3 * atr)]
     block = [lv for lv in block if abs(lv["price"] - price) < 0.8 * gap]
     if block:
-        delta -= 10 if any(lv["htf"] for lv in block) else 6
+        htf_block = any(lv["htf"] for lv in block)
+        delta -= 10 if htf_block else 6
+        c["sr_obstructed"] = bool(htf_block and SR_HARD_BLOCK)
         c.setdefault("reasons", []).append(f"TP terhalang {'resistance' if long else 'support'} {block[0]['price']:.8g}")
     if note:
         c.setdefault("reasons", []).append(note)
@@ -1017,12 +1066,27 @@ def _liquidity_sweep_setup(direction, df, m15, m30, price, atr, btc_move, is_btc
     prior = df.iloc[-(SWING_LOOKBACK+1):-1]
     if len(prior) < SWING_LOOKBACK: return _strategy_reject(direction, diag, "data swing belum cukup")
     low_level, high_level = float(prior["low"].min()), float(prior["high"].max())
+    rng = max(1e-12, float(e["high"]) - float(e["low"]))
+    body_ratio = abs(float(e["close"]) - float(e["open"])) / rng
+    close_location = (float(e["close"]) - float(e["low"])) / rng
+    vol_x = float(e["volume"] / e["vol_sma20"]) if pd.notna(e["vol_sma20"]) and e["vol_sma20"] > 0 else 0.0
+    # A valid sweep must pierce liquidity then reclaim it with a meaningful close, not just a long wick.
+    reclaim_buffer = 0.05 * atr
     if long:
-        trigger = float(e["low"]) < low_level and float(e["close"]) > low_level and float(e["close"]) > float(e["open"])
+        swept = float(e["low"]) < low_level
+        reclaimed = float(e["close"]) >= low_level + reclaim_buffer
+        candle_ok = float(e["close"]) > float(e["open"]) and close_location >= 0.60
     else:
-        trigger = float(e["high"]) > high_level and float(e["close"]) < high_level and float(e["close"]) < float(e["open"])
+        swept = float(e["high"]) > high_level
+        reclaimed = float(e["close"]) <= high_level - reclaim_buffer
+        candle_ok = float(e["close"]) < float(e["open"]) and close_location <= 0.40
+    trigger = swept and reclaimed and candle_ok and body_ratio >= 0.30 and vol_x >= 0.80
     adx30 = float(m30["adx"]) if pd.notna(m30["adx"]) else 0.0
-    if not trigger: return _strategy_reject(direction, diag, "belum ada sweep dan close kembali ke range")
+    if not swept: return _strategy_reject(direction, diag, "belum menyapu swing high/low sebelumnya")
+    if not reclaimed: return _strategy_reject(direction, diag, "sweep belum reclaim level dengan buffer 0.05 ATR")
+    if not candle_ok or body_ratio < 0.30: return _strategy_reject(direction, diag, "konfirmasi candle sweep lemah (close location/body tidak cukup)")
+    if vol_x < 0.80: return _strategy_reject(direction, diag, f"volume sweep terlalu rendah ({vol_x:.1f}x SMA20)")
+    if not trigger: return _strategy_reject(direction, diag, "sweep belum terkonfirmasi")
     if adx30 > REGIME_TREND_ADX + 8:
         return _strategy_reject(direction, diag, "tren 30m terlalu kuat untuk reversal sweep")
     if not is_btc and btc_move is not None and ((long and btc_move <= -BTC_DUMP_ATR) or (not long and btc_move >= BTC_DUMP_ATR)):
@@ -1031,30 +1095,39 @@ def _liquidity_sweep_setup(direction, df, m15, m30, price, atr, btc_move, is_btc
     if not levels: return _strategy_reject(direction, diag, "risiko/biaya liquidity sweep tidak valid")
     sl,tp,risk,risk_pct,fee_r,rr=levels
     score = min(90, 70 + (8 if abs(float(e["close"])- (low_level if long else high_level)) <= .35*atr else 3) + (5 if adx30 <= REGIME_RANGE_ADX else 0))
-    return {"direction":direction,"stage":"TRIGGER","score":int(score),"sl":sl,"tp":tp,"rr":rr,"risk_pct":risk_pct,"reward_pct":risk_pct*rr,"fee_r":fee_r,"adx":adx30,"vol_x":float(e["volume"] / e["vol_sma20"]) if pd.notna(e["vol_sma20"]) and e["vol_sma20"] else 0,"rsi":float(e["rsi"]),"reasons":["Liquidity sweep swing","Close kembali ke range","Reversal candle"],"confirm15":True,"strategy":"LIQUIDITY_SWEEP"}
+    return {"direction":direction,"stage":"TRIGGER","score":int(score),"sl":sl,"tp":tp,"rr":rr,"risk_pct":risk_pct,"reward_pct":risk_pct*rr,"fee_r":fee_r,"adx":adx30,"vol_x":vol_x,"rsi":float(e["rsi"]),"reasons":["Sweep swing high/low","Reclaim level + buffer 0.05 ATR","Body/close location terkonfirmasi",f"Volume {vol_x:.1f}x"],"confirm15":True,"strategy":"LIQUIDITY_SWEEP"}
 
 
 def _select_strategy_functions(adx30, trend_up, trend_down):
-    """Return strategy functions and market regime for the configured routing policy."""
+    """Select a small, testable core by regime; experimental strategies are opt-in."""
     if SIGNAL_STRATEGY == "adaptive":
         if adx30 >= REGIME_TREND_ADX and (trend_up or trend_down):
-            return (_breakout_retest_setup, _ema_vwap_setup, _stochrsi_pullback_setup, _supertrend_flip_setup, _sr_bounce_setup), "TREND"
+            methods = [_breakout_retest_setup, _ema_vwap_setup, _vwap_reclaim_retest_setup]
+            if ADAPTIVE_INCLUDE_TREND_EXPERIMENTS:
+                methods.extend([_stochrsi_pullback_setup, _supertrend_flip_setup])
+            return tuple(methods), "TREND"
         if adx30 <= REGIME_RANGE_ADX:
-            return (_bb_rsi_setup, _liquidity_sweep_setup, _squeeze_breakout_setup, _sr_bounce_setup), "RANGE"
-        methods = ((_breakout_retest_setup, _bb_rsi_setup, _ema_vwap_setup, _squeeze_breakout_setup, _liquidity_sweep_setup,
-                    _stochrsi_pullback_setup, _supertrend_flip_setup, _sr_bounce_setup)
-                   if ACTIVE_FILTER else (_breakout_retest_setup, _bb_rsi_setup))
-        return methods, "TRANSITION"
+            methods = [_bb_rsi_setup]
+            if ADAPTIVE_INCLUDE_SWEEP:
+                methods.append(_liquidity_sweep_setup)
+            return tuple(methods), "RANGE"
+        methods = [_breakout_retest_setup, _bb_rsi_setup, _ema_vwap_setup, _vwap_reclaim_retest_setup] if ACTIVE_FILTER else [_breakout_retest_setup, _bb_rsi_setup]
+        if ADAPTIVE_INCLUDE_SWEEP:
+            methods.append(_liquidity_sweep_setup)
+        return tuple(methods), "TRANSITION"
     methods = {
         "breakout_retest": (_breakout_retest_setup,),
         "bb_rsi": (_bb_rsi_setup,),
         "both": (_breakout_retest_setup, _bb_rsi_setup),
+        "ema_vwap": (_ema_vwap_setup,),
+        "vwap_reclaim": (_vwap_reclaim_retest_setup,),
+        "liquidity_sweep": (_liquidity_sweep_setup,),
         "squeeze": (_squeeze_breakout_setup,),
         "stochrsi": (_stochrsi_pullback_setup,),
         "supertrend": (_supertrend_flip_setup,),
         "sr": (_sr_bounce_setup,),
-        "all": (_breakout_retest_setup, _bb_rsi_setup, _ema_vwap_setup, _squeeze_breakout_setup, _liquidity_sweep_setup,
-                _stochrsi_pullback_setup, _supertrend_flip_setup, _sr_bounce_setup),
+        "all": (_breakout_retest_setup, _bb_rsi_setup, _ema_vwap_setup, _vwap_reclaim_retest_setup, _squeeze_breakout_setup,
+                _liquidity_sweep_setup, _stochrsi_pullback_setup, _supertrend_flip_setup, _sr_bounce_setup),
     }.get(SIGNAL_STRATEGY, (_breakout_retest_setup, _bb_rsi_setup))
     return methods, "MANUAL"
 
@@ -1067,7 +1140,10 @@ async def analyze_symbol(client: BybitMarket, symbol: str, entry_tf: str = "5", 
     def reject(reason):
         if diag is not None:
             diag.setdefault("reasons", []).insert(0, reason)
+        log.info("Setup rejected symbol=%s tf=%s reason=%s", symbol, entry_tf, reason)
         return None
+
+    diag_ctx = diag if diag is not None else {"reasons": []}
 
     if in_news_blackout():
         return reject(f"jendela news besar (±{NEWS_WINDOW_MIN} menit)")
@@ -1101,7 +1177,9 @@ async def analyze_symbol(client: BybitMarket, symbol: str, entry_tf: str = "5", 
         try:
             btc_move = await client.btc_move_atr()
         except Exception as exc:
-            log.warning("Filter BTC dilewati (data BTC gagal): %s", exc)
+            log.warning("Data filter BTC gagal: %s", exc)
+            if BTC_FILTER_FAIL_CLOSED:
+                return reject("filter BTC tidak tersedia; entry altcoin ditolak demi keamanan")
 
     # Adaptive regime routing: trend continuation in strong trends, mean reversion/sweep in ranges.
     adx30 = float(m30["adx"]) if pd.notna(m30["adx"]) else 0.0
@@ -1109,15 +1187,67 @@ async def analyze_symbol(client: BybitMarket, symbol: str, entry_tf: str = "5", 
     trend_down = float(m30["close"]) < float(m30["ema200"]) and float(m30["ema20"]) < float(m30["ema50"])
     strategy_fns, regime = _select_strategy_functions(adx30, trend_up, trend_down)
     cands = [c for fn in strategy_fns for c in
-             (fn(d, df, m15, m30, price, atr, btc_move, is_btc, diag) for d in ("LONG", "SHORT")) if c]
+             (fn(d, df, m15, m30, price, atr, btc_move, is_btc, diag_ctx) for d in ("LONG", "SHORT")) if c]
     if not cands:
-        if diag is not None and diag.get("reasons"):
-            rs = diag["reasons"]
-            useful = [r for r in rs if "tren 30m tidak searah" not in r]  # alasan arah yang paling dekat valid lebih informatif
-            diag["reasons"] = (useful or rs)[:2]
+        rs = diag_ctx.get("reasons", [])
+        useful = [r for r in rs if "tren 30m tidak searah" not in r]
+        summary = (useful or rs)[:3]
+        if diag is not None:
+            diag["reasons"] = summary
+        log.info("No setup symbol=%s tf=%s regime=%s reasons=%s", symbol, entry_tf, regime, " | ".join(summary) if summary else "no strategy trigger")
         return None
     cands = [_sr_confluence(c, df, price, atr) for c in cands]   # S/R sebagai konfirmasi semua strategi
-    best = max(cands, key=lambda c: (c["stage"] == "TRIGGER", c["score"]))
+    # Hard safety gates: avoid chasing stretched entries and trend setups in choppy regimes.
+    filtered = []
+    ema20 = float(df["ema20"].iloc[-1]) if pd.notna(df["ema20"].iloc[-1]) else price
+    vwap_now = float(df["vwap"].iloc[-1]) if pd.notna(df["vwap"].iloc[-1]) else ema20
+    extension = min(abs(price-ema20), abs(price-vwap_now)) / atr if atr > 0 else 999.0
+    cross_count = int(((df["ema20"] > df["ema50"]) != (df["ema20"].shift(1) > df["ema50"].shift(1))).tail(20).sum())
+    close_series = df["close"].tail(12).astype(float)
+    net_move = abs(float(close_series.iloc[-1]) - float(close_series.iloc[0]))
+    path_move = float(close_series.diff().abs().sum())
+    efficiency = net_move / path_move if path_move > 0 else 0.0
+    for c in cands:
+        strategy = c.get("strategy", "")
+        if ANTI_CHASE_ENABLED and extension > MAX_EXTENDED_ATR and strategy not in ("BB_RSI", "LIQUIDITY_SWEEP", "SR_BOUNCE"):
+            log.info("Setup rejected symbol=%s tf=%s strategy=%s reason=anti-chase extension %.2f ATR", symbol, entry_tf, strategy, extension)
+            if diag is not None: diag.setdefault("reasons", []).append(f"{strategy}: anti-chase ({extension:.2f} ATR dari EMA/VWAP)")
+            continue
+        trend_setup = strategy in ("BREAKOUT_RETEST", "EMA_PULLBACK_VWAP", "VWAP_RECLAIM_RETEST", "SQUEEZE_BREAKOUT", "STOCHRSI_PULLBACK", "SUPERTREND_FLIP")
+        if CHOP_FILTER_ENABLED and trend_setup and adx30 < REGIME_RANGE_ADX and (cross_count >= 4 or efficiency < 0.20):
+            log.info("Setup rejected symbol=%s tf=%s strategy=%s reason=choppy market crosses=%d efficiency=%.2f", symbol, entry_tf, strategy, cross_count, efficiency)
+            if diag is not None: diag.setdefault("reasons", []).append(f"{strategy}: pasar choppy (EMA cross {cross_count}, efficiency {efficiency:.2f})")
+            continue
+        # Additional quality points; these are ranking heuristics, not win probabilities.
+        q = int(c.get("score", 0))
+        aligned = (trend_up if c["direction"] == "LONG" else trend_down)
+        if aligned: q += 4
+        if float(c.get("vol_x", 0) or 0) >= 1.2: q += 3
+        if spread_pct <= MAX_SPREAD_PCT * 0.5: q += 3
+        if float(c.get("rr", 0) or 0) >= 1.5: q += 3
+        if extension > 0.9: q -= 4
+        c["raw_score"] = int(c.get("score", 0))
+        c["score"] = max(0, min(100, q))
+        c["quality_factors"] = {"htf_aligned": bool(aligned), "volume_x": round(float(c.get("vol_x", 0) or 0), 2),
+                                 "spread_pct": round(spread_pct, 4), "rr": round(float(c.get("rr", 0) or 0), 2),
+                                 "extension_atr": round(extension, 2), "ema_crosses_20": cross_count, "efficiency_ratio": round(efficiency, 2)}
+        filtered.append(c)
+    cands = [c for c in filtered if not c.get("sr_obstructed")]
+    if not cands:
+        return reject("semua setup ditolak filter kualitas (anti-chase/chop/SR); lihat log alasan penolakan")
+    # One signal per symbol/timeframe: ranking chooses a single setup, not a vote-count.
+    best = max(cands, key=lambda c: (c["stage"] == "TRIGGER", c["score"], c.get("rr", 0)))
+    if FALSE_BREAKOUT_FILTER_ENABLED and best.get("strategy") in ("BREAKOUT_RETEST", "SQUEEZE_BREAKOUT"):
+        last = df.iloc[-1]
+        candle_range = max(1e-12, float(last["high"])-float(last["low"]))
+        body_ratio = abs(float(last["close"])-float(last["open"])) / candle_range
+        close_loc = (float(last["close"])-float(last["low"])) / candle_range
+        vol_x = float(best.get("vol_x", 0) or 0)
+        direction_ok = (best["direction"] == "LONG" and close_loc >= 0.60) or (best["direction"] == "SHORT" and close_loc <= 0.40)
+        if body_ratio < 0.35 or not direction_ok or vol_x < 0.9:
+            return reject(f"false-breakout filter: body={body_ratio:.2f}, close-location={close_loc:.2f}, volume={vol_x:.1f}x")
+    if best["score"] < MIN_SETUP_SCORE:
+        return reject(f"quality score {best['score']} < MIN_SETUP_SCORE {MIN_SETUP_SCORE} (raw {best.get('raw_score', best['score'])})")
     # Filter ulang memakai estimasi biaya round-trip: fee taker + spread pasar.
     # Ini lebih relevan untuk optimasi net R daripada fee saja.
     funding = ticker.get("fundingRate")

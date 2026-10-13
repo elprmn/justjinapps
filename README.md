@@ -103,3 +103,29 @@ Halaman `/trade` (tautan personal dari Discord) kini menampilkan:
 - **Performa per Strategi:** jumlah trade, win rate, dan Net R tiap strategi, supaya kelihatan strategi mana yang gagal.
 
 Net % = Net R × jarak SL (% dari harga entry follower), sudah dikurangi estimasi fee, spread, slippage, dan funding. Jumlah follow yang dimuat diatur `HISTORY_LIMIT` (default 1000 terbaru). Trade lama bertanda `MACD_DIVERGENCE` tetap tampil di riwayat; hanya sinyal baru yang tidak lagi memakai metode itu.
+
+
+## Scalping signal quality safeguards
+
+- `SIGNAL_STRATEGY` is validated against the actual supported strategy router. Supported manual values include `breakout_retest`, `bb_rsi`, `both`, `ema_vwap`, `liquidity_sweep`, `squeeze`, `stochrsi`, `supertrend`, `sr`, `all`, and `adaptive`.
+- The default `adaptive` route uses a smaller core. Trend regime prioritizes Breakout Retest and EMA/VWAP Pullback; range regime uses BB+RSI. StochRSI/Supertrend experiments are opt-in with `ADAPTIVE_INCLUDE_TREND_EXPERIMENTS=1`. Liquidity Sweep is opt-in with `ADAPTIVE_INCLUDE_SWEEP=1`; test each independently before enabling.
+- `BTC_FILTER_FAIL_CLOSED=1` rejects altcoin setups when BTC filter data cannot be fetched instead of silently bypassing that risk check.
+- `SR_HARD_BLOCK=1` rejects a candidate when its target is obstructed by a higher-timeframe support/resistance level.
+- Candle fetching excludes the currently forming candle. This project remains a Discord signal/simulation bot; these safeguards do not make it an exchange order executor and do not establish profitability.
+
+Run offline checks with `python -m py_compile market.py bot.py database.py` and `python -m unittest discover -s tests -v`. These are code/unit checks, not a historical backtest.
+
+
+## Additional setup-quality controls
+
+The scanner includes conservative filters intended to reject weaker scalping setups; these are heuristics and are not a claim of profitability.
+
+- `MIN_SETUP_SCORE=75`: minimum internal quality score (0-100) after confluence adjustments. Tune only with out-of-sample backtests.
+- `ANTI_CHASE_ENABLED=1`: avoids entering extended trend/breakout setups. `MAX_EXTENDED_ATR` controls the extension threshold.
+- `CHOP_FILTER_ENABLED=1`: rejects trend-following setups in low-ADX/choppy conditions using EMA-cross frequency and price efficiency.
+- `FALSE_BREAKOUT_FILTER_ENABLED=1`: checks breakout candle body, close location and relative volume.
+- `vwap_reclaim`: optional strategy route for VWAP reclaim + retest (`SIGNAL_STRATEGY=vwap_reclaim`). In adaptive mode it is considered in trend/transition regimes.
+- Liquidity sweep requires reclaim beyond the swing level, meaningful candle body/close location and at least 0.8x average volume.
+- Rejection reasons are written to application logs; accepted signal records retain raw score and quality factors for later analysis.
+
+These filters are rule-based, not validated win probabilities. Run historical backtests with realistic fees/slippage and paper-trade before relying on alerts. The bot uses public market data and does not execute exchange orders.

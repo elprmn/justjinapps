@@ -33,7 +33,7 @@ class StrategySmokeTests(unittest.TestCase):
         self.assertTrue(np.isfinite(self.df.vwap.iloc[-1]))
 
     def test_new_strategy_functions_are_callable(self):
-        funcs = (market._ema_vwap_setup, market._squeeze_breakout_setup, market._liquidity_sweep_setup,
+        funcs = (market._ema_vwap_setup, market._vwap_reclaim_retest_setup, market._squeeze_breakout_setup, market._liquidity_sweep_setup,
                  market._stochrsi_pullback_setup, market._supertrend_flip_setup, market._sr_bounce_setup)
         for fn in funcs:
             for direction in ("LONG", "SHORT"):
@@ -50,16 +50,38 @@ class StrategySmokeTests(unittest.TestCase):
     def test_adaptive_routing(self):
         methods, regime = market._select_strategy_functions(30, True, False)
         self.assertEqual(regime, "TREND")
-        self.assertEqual({fn.__name__ for fn in methods}, {"_breakout_retest_setup", "_ema_vwap_setup", "_stochrsi_pullback_setup", "_supertrend_flip_setup", "_sr_bounce_setup"})
+        self.assertEqual({fn.__name__ for fn in methods}, {"_breakout_retest_setup", "_ema_vwap_setup", "_vwap_reclaim_retest_setup"})
+        self.assertNotIn(market._sr_bounce_setup, methods)  # eksperimen tidak ikut routing default
+        self.assertNotIn(market._stochrsi_pullback_setup, methods)
+        self.assertNotIn(market._supertrend_flip_setup, methods)
         methods, regime = market._select_strategy_functions(10, False, False)
         self.assertEqual(regime, "RANGE")
         self.assertIn(market._bb_rsi_setup, methods)
-        self.assertIn(market._liquidity_sweep_setup, methods)
-        self.assertIn(market._squeeze_breakout_setup, methods)
+        self.assertNotIn(market._liquidity_sweep_setup, methods)  # opt-in setelah backtest
+        self.assertNotIn(market._squeeze_breakout_setup, methods)  # strategi eksperimen
         self.assertFalse(hasattr(market, "_macd_divergence_setup"))
         methods, regime = market._select_strategy_functions(21, False, False)
         self.assertEqual(regime, "TRANSITION")
         self.assertGreaterEqual(len(methods), 2)
+
+
+    def test_strategy_allowlist_and_manual_routes(self):
+        from unittest import mock
+        self.assertIn("ema_vwap", market.SUPPORTED_STRATEGIES)
+        self.assertIn("liquidity_sweep", market.SUPPORTED_STRATEGIES)
+        self.assertIn("vwap_reclaim", market.SUPPORTED_STRATEGIES)
+        with mock.patch.object(market, "SIGNAL_STRATEGY", "ema_vwap"):
+            methods, regime = market._select_strategy_functions(20, False, False)
+            self.assertEqual(regime, "MANUAL")
+            self.assertEqual(methods, (market._ema_vwap_setup,))
+        with mock.patch.object(market, "SIGNAL_STRATEGY", "liquidity_sweep"):
+            methods, regime = market._select_strategy_functions(20, False, False)
+            self.assertEqual(regime, "MANUAL")
+            self.assertEqual(methods, (market._liquidity_sweep_setup,))
+        with mock.patch.object(market, "SIGNAL_STRATEGY", "vwap_reclaim"):
+            methods, regime = market._select_strategy_functions(20, False, False)
+            self.assertEqual(regime, "MANUAL")
+            self.assertEqual(methods, (market._vwap_reclaim_retest_setup,))
 
     def test_squeeze_breakout_triggers_on_constructed_data(self):
         from unittest import mock
