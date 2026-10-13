@@ -6,16 +6,20 @@ Ini scanner eksperimental, **bukan strategi yang terbukti profit**. Jalankan pap
 ## Metode: Adaptive Scalping (entry 5m/15m, regime filter 30m)
 
 Default `SIGNAL_STRATEGY=adaptive` memilih metode sesuai kondisi pasar 30m:
-- **Tren kuat** (ADX ≥ `REGIME_TREND_ADX`, arah EMA/close sejalan): Breakout + Retest dan EMA Pullback + VWAP.
-- **Range** (ADX ≤ `REGIME_RANGE_ADX`): Bollinger Bands + RSI, Liquidity Sweep + Reversal, dan MACD Divergence.
-- **Transisi**: jika `ACTIVE_FILTER=1`, bot mengevaluasi kelima metode; jika `0`, hanya Breakout + Retest dan BB + RSI.
+- **Tren kuat** (ADX ≥ `REGIME_TREND_ADX`, arah EMA/close sejalan): Breakout + Retest, EMA Pullback + VWAP, StochRSI Pullback, Supertrend Flip, dan SR Bounce.
+- **Range** (ADX ≤ `REGIME_RANGE_ADX`): Bollinger Bands + RSI, Liquidity Sweep + Reversal, Squeeze Breakout, dan SR Bounce.
+- **Transisi**: jika `ACTIVE_FILTER=1`, bot mengevaluasi kedelapan metode; jika `0`, hanya Breakout + Retest dan BB + RSI.
 
-Metode yang tersedia: `breakout_retest`, `bb_rsi`, `both`, `all`, `adaptive`. `MIN_SIGNAL_SCORE=65` pada `.env.example` merupakan setelan lebih aktif; naikkan jika terlalu banyak sinyal. Skor 0–100 adalah ranking heuristik, **bukan probabilitas menang**.
+Metode yang tersedia: `breakout_retest`, `bb_rsi`, `squeeze`, `stochrsi`, `supertrend`, `sr`, `both`, `all`, `adaptive`. `MIN_SIGNAL_SCORE=65` pada `.env.example` merupakan setelan lebih aktif; naikkan jika terlalu banyak sinyal. Skor 0–100 adalah ranking heuristik, **bukan probabilitas menang**.
 
 - **Breakout + Retest:** breakout rentang lalu retest dan close kembali mempertahankan level, dengan filter volume, tren 15m/30m, BTC, likuiditas, dan biaya.
 - **Bollinger Bands + RSI:** candle tertutup sebelumnya keluar band lalu candle terbaru kembali masuk, RSI berbalik, dan ADX 30m tidak terlalu tinggi.
 - **EMA Pullback + VWAP:** tren 15m/30m, pullback EMA20, close searah VWAP dan candle konfirmasi.
-- **MACD + Divergence:** swing harga membuat extreme baru sementara MACD histogram tidak mengonfirmasi, lalu candle reversal menutup searah.
+- **Squeeze Breakout (baru, menggantikan MACD Divergence):** lebar Bollinger menyempit (≥3 dari 6 candle terakhir di persentil bawah `SQUEEZE_PCTL` dari 100 candle), lalu candle momentum (body ≥55% range) menutup di luar band searah tren 15m/30m dengan volume ≥ `SQUEEZE_MIN_VOLUME`× SMA20. Tidak dikejar jika sudah >3 ATR dari BB mid. SL di bawah/atas 3 candle terakhir, TP = `TP_R`.
+- **StochRSI Pullback (baru):** tren rapi (EMA 9>21>50 di entry TF, EMA20>EMA50 di 15m, close>EMA50 di 30m), harga pullback menyentuh EMA21 dan StochRSI sempat di area jenuh (`STOCH_OVERSOLD`/`STOCH_OVERBOUGHT`), lalu K memotong D searah tren dengan candle konfirmasi. SL di swing 6 candle, TP `TP_R`.
+- **Supertrend Flip (baru):** Supertrend (`ST_PERIOD`, `ST_MULT`) berbalik arah pada candle terakhir, searah EMA200 entry TF + tren 15m/30m + EMA200 30m, body candle ≥50% range, ADX ≥ `ST_MIN_ADX`, volume ≥ `ST_MIN_VOLUME`×. SL di garis Supertrend; ditolak jika garis lebih jauh dari batas SL. `ST_MULT` ≥ 2 membuat hampir semua flip ditolak karena SL terlalu lebar, jadi default 1,5.
+- **SR Bounce (baru):** level Support/Resistance dibentuk dari pivot high/low (`SR_LOOKBACK` candle, dikelompokkan dalam 0,3 ATR, minimal `SR_MIN_TOUCHES` sentuhan) di timeframe entry, ditambah level 30m (level yang cocok di dua TF diberi tanda "30m" dan skor lebih tinggi). Entry saat candle menyentuh zona level, menolaknya (wick ≥40% atau engulfing) dan menutup kembali di sisi level; ditolak jika melawan tren 30m yang kuat atau level sudah ditembus. SL di balik level/wick, TP = `TP_R` atau level lawan terdekat, minimal 1R.
+- **S/R sebagai konfirmasi semua strategi** (`SR_CONFLUENCE=1`): skor +4 (+6 jika level 30m) bila entry dekat level searah (support untuk LONG, resistance untuk SHORT), dan −6 (−10 jika level 30m) bila ada level lawan di antara entry dan TP. Ini hanya mengubah skor/alasan, bukan menolak setup; filter `MIN_SIGNAL_SCORE` yang menentukan. Set `SR_CONFLUENCE=0` untuk mematikan.
 - **Liquidity Sweep + Reversal:** harga menyapu swing high/low sebelumnya lalu menutup kembali ke dalam rentang.
 
 ## Biaya dan hasil simulasi
@@ -62,7 +66,7 @@ Embed SIGNAL kini 3 baris deskripsi (Entry/SL/TP · RR/skor/fee/spread · alasan
 
 ## Strategi Scalping (paper trading)
 
-Strategi default adalah `SIGNAL_STRATEGY=adaptive`: pada tren kuat memakai Breakout + Retest, EMA Pullback + VWAP, dan MACD Divergence; pada range memakai Bollinger Bands + RSI, Liquidity Sweep + Reversal, dan MACD Divergence; di kondisi transisi mengevaluasi kelima metode. Opsi manual: `breakout_retest`, `bb_rsi`, `both`, atau `all`. Timeframe entry tetap `5,15` dengan filter rezim 30m.
+Strategi default adalah `SIGNAL_STRATEGY=adaptive`: pada tren kuat memakai Breakout + Retest dan EMA Pullback + VWAP; pada range memakai Bollinger Bands + RSI, Liquidity Sweep + Reversal, dan Squeeze Breakout; di kondisi transisi mengevaluasi kelima metode. Opsi manual: `breakout_retest`, `bb_rsi`, `both`, atau `all`. Timeframe entry tetap `5,15` dengan filter rezim 30m.
 
 - **Breakout + Retest:** menunggu breakout range, retest level, candle searah, volume minimum, konfirmasi 15m dan tren 30m, serta filter likuiditas/BTC/biaya.
 - **Bollinger + RSI:** menunggu candle sebelumnya keluar dari band lalu candle tertutup kembali masuk, RSI berbalik dari area ekstrem, candle konfirmasi, dan ADX 30m tidak terlalu tinggi. Target dibatasi oleh BB midline dan `TP_R`.
@@ -90,3 +94,12 @@ Railway must expose the app's `PORT` (the bot binds the web dashboard to `0.0.0.
 
 The private `/trade` dashboard is a responsive dark glassmorphism UI inspired by the JustJinApps visual reference. It includes a sidebar, portfolio PNL summary, active position cards, followed-pair market overview, a current-position PNL visualization, live snapshot stats, and a paper-trading/privacy note. The dashboard refreshes its own data every 15 seconds. Market rows and PNL visualization are based on followed open positions returned by the bot; they are not external market-wide tickers or historical account-performance data.
 
+
+
+## Dashboard: riwayat trade & total PNL
+Halaman `/trade` (tautan personal dari Discord) kini menampilkan:
+- **Total PNL · All Time:** total net (realized + posisi terbuka), realized net %, Net R, win rate, jumlah trade selesai, profit factor, max drawdown, rata-rata R, best/worst trade, dan **equity curve** (kumulatif net % realized).
+- **Trade History:** seluruh trade selesai (TP/SL/Ambigu/Expired) terbaru dulu, dengan filter Semua/Menang/Kalah dan tombol "Tampilkan lebih banyak". Kolom: waktu tutup, pair, side, TF, hasil, Net R, Net %, strategi, entry, exit.
+- **Performa per Strategi:** jumlah trade, win rate, dan Net R tiap strategi, supaya kelihatan strategi mana yang gagal.
+
+Net % = Net R × jarak SL (% dari harga entry follower), sudah dikurangi estimasi fee, spread, slippage, dan funding. Jumlah follow yang dimuat diatur `HISTORY_LIMIT` (default 1000 terbaru). Trade lama bertanda `MACD_DIVERGENCE` tetap tampil di riwayat; hanya sinyal baru yang tidak lagi memakai metode itu.

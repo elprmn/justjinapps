@@ -280,15 +280,16 @@ class Database:
         return rec
 
     async def user_follows(self, user_id, limit=100):
-        """Follow milik user, terbaru dulu."""
+        """Follow milik user, terbaru dulu. MGET dipecah per 200 key agar request Upstash tetap kecil."""
         sids = await self.redis.zrevrange(self.key(f"user_follows:{user_id}"), 0, max(0, limit - 1))
         if not sids: return []
-        raws = await self.redis.mget([self.key(f"follow:{sid}:{user_id}") for sid in sids])
         out = []
-        for raw in raws:
-            if raw:
-                try: out.append(json.loads(raw))
-                except json.JSONDecodeError: pass
+        for i in range(0, len(sids), 200):
+            raws = await self.redis.mget([self.key(f"follow:{sid}:{user_id}") for sid in sids[i:i + 200]])
+            for raw in raws:
+                if raw:
+                    try: out.append(json.loads(raw))
+                    except json.JSONDecodeError: pass
         return out
 
     async def close(self):
